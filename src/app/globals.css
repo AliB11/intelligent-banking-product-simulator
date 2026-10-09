@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Vazirmatn Variable", "Vazirmatn", Tahoma, "Segoe UI", sans-serif;
+}
+
+html {
+  font-family: var(--font-sans);
+  scroll-behavior: smooth;
+}
+
+body {
+  background:
+    radial-gradient(1200px 500px at 100% -10%, rgba(99, 102, 241, 0.08), transparent 60%),
+    radial-gradient(900px 400px at -10% 10%, rgba(20, 184, 166, 0.07), transparent 60%),
+    #f6f7fb;
+}
+
+input[type="range"] {
+  accent-color: #6366f1;
+  cursor: pointer;
+}
+
+.hero-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.ltr {
+  direction: ltr;
+}
+
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  direction: rtl;
+  text-align: right;
+  border-radius: 12px !important;
+  font-family: var(--font-sans);
+}
+
+.recharts-text {
+  font-family: var(--font-sans);
+}
+
+@keyframes floaty {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-6px);
+  }
+}
+
+.floaty {
+  animation: floaty 4s ease-in-out infinite;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+
+@media print {
+  header,
+  footer,
+  nav,
+  button,
+  select,
+  input {
+    display: none !important;
+  }
+  body {
+    background: #fff !important;
+  }
+  section {
+    break-inside: avoid;
+  }
+}
