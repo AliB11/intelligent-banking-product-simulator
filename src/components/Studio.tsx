@@ -9,6 +9,7 @@ import { analyzeResult } from "@/lib/engine/advisor";
 import { CBI, CHANNELS, COLLATERALS, CONTRACTS, FAMILIES, KINDS, PURPOSES, REPAYMENTS, SEGMENTS, rewardRate, scoreGrade } from "@/lib/engine/catalog";
 import { pointsLoanLimit } from "@/lib/engine/math";
 import { QUICK_PARAMS, repaymentPreview, simulatePortfolio } from "@/lib/engine/simulator";
+import { changeContractConfig, changeFamilyConfig, changeKindConfig, type StructuralChange } from "@/lib/engine/profile";
 import { mergeConfig, suggestName } from "@/lib/engine/templates";
 import type { Channel, Collateral, Contract, Family, FullResult, Kind, ProductConfig, Purpose, Repayment, Segment } from "@/lib/engine/types";
 import { fmt, money, mt, pct } from "@/lib/format";
@@ -25,6 +26,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
   const computing = previewConfig !== cfg;
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [nameSeed, setNameSeed] = useState(7);
   const [calcBalance, setCalcBalance] = useState(100);
   const [calcDays, setCalcDays] = useState(180);
@@ -46,22 +48,15 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
   const setS = <S extends Section, K extends keyof ProductConfig[S]>(s: S, k: K, v: ProductConfig[S][K]) =>
     setCfg((c) => ({ ...c, [s]: { ...c[s], [k]: v } }) as ProductConfig);
 
-  const changeFamily = (f: Family) =>
-    setCfg((c) => {
-      let kind: Kind = c.kind;
-      if (f === "points") kind = c.kind === "loyalty" ? "loyalty" : "points_loan";
-      else if (c.kind === "points_loan" || c.kind === "loyalty") kind = f === "hybrid" ? "credit_card" : "installment";
-      const contract: Contract = kind === "points_loan" ? "qard" : kind === "credit_card" ? "murabaha" : c.contract;
-      return { ...c, family: f, kind, contract };
-    });
-  const changeKind = (k: Kind) =>
-    setCfg((c) => ({
-      ...c,
-      kind: k,
-      family: KINDS[k].family.includes(c.family) ? c.family : KINDS[k].family[0],
-      contract: k === "points_loan" ? "qard" : k === "credit_card" ? "murabaha" : c.contract,
-      credit: k === "credit_card" ? { ...c.credit, tenor: Math.min(36, Math.max(12, c.credit.tenor)) } : c.credit,
-    }));
+  // Family, kind and contract are one coherent choice: every change goes through the structural
+  // layer, which keeps the contract, purpose and rate compatible and explains automatic repairs.
+  const applyStructural = (change: StructuralChange) => {
+    setCfg(change.cfg);
+    setNotice(change.notes.length ? change.notes.join(" ") : null);
+  };
+  const changeFamily = (f: Family) => applyStructural(changeFamilyConfig(cfg, f));
+  const changeKind = (k: Kind) => applyStructural(changeKindConfig(cfg, k));
+  const changeContract = (c: Contract) => applyStructural(changeContractConfig(cfg, c));
 
   const isPoints = cfg.kind === "points_loan";
   const isLoyalty = cfg.kind === "loyalty";
@@ -131,6 +126,11 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
           </div>
         </div>
         {error && <div className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</div>}
+        {notice && (
+          <div role="status" className="rounded-xl border border-sky-200 bg-sky-50 p-3 text-sm leading-6 text-sky-800">
+            ℹ️ {notice}
+          </div>
+        )}
         <Tabs tabs={tabs} value={activeTab} onChange={setTab} />
 
         {activeTab === "identity" && (
@@ -175,7 +175,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
               <Select<Contract>
                 label="عقد اسلامی"
                 value={cfg.contract}
-                onChange={(v) => setTop("contract", v)}
+                onChange={changeContract}
                 options={(Object.keys(CONTRACTS) as Contract[]).map((c) => ({ value: c, label: `${CONTRACTS[c].label} (${CONTRACTS[c].type})` }))}
                 hint={CONTRACTS[cfg.contract].note}
               />
