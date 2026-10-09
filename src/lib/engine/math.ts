@@ -170,21 +170,21 @@ export function buildSchedule(
     installment = P * r + (n === 1 ? P : 0);
     for (let i = 0; i < n; i++) push(b * r, i === n - 1 ? b : 0);
   } else if (method === "seasonal") {
-    const q = Math.max(1, Math.round(n / 3));
-    const rq = Math.pow(1 + r, 3) - 1;
-    const A = rq === 0 ? P / q : (P * rq) / (1 - Math.pow(1 + rq, -q));
-    installment = A / 3;
-    for (let i = 0; i < q * 3; i++) {
+    // Equal quarterly payments, with a final short period at contractual maturity.
+    const dates = Array.from({ length: Math.ceil(n / 3) }, (_, i) => Math.min(n, (i + 1) * 3));
+    const A = P / dates.reduce((pv, m) => pv + Math.pow(1 + r, -m), 0);
+    installment = A / Math.min(3, n);
+    let accrued = 0;
+    for (let m = 1; m <= n; m++) {
       const it = b * r;
+      accrued += it;
       b += it;
-      let p = 0;
-      if ((i + 1) % 3 === 0) {
-        p = i + 1 === q * 3 ? b : Math.min(A, b);
-        b -= p;
-      }
-      pay.push(p);
-      int.push(it);
-      prin.push(Math.max(0, p - it));
+      const payment = dates.includes(m) ? (m === n ? b : Math.min(A, b)) : 0;
+      b -= payment;
+      pay.push(payment);
+      int.push(payment ? accrued : 0);
+      prin.push(payment ? payment - accrued : 0);
+      if (payment) accrued = 0;
       bal.push(Math.max(0, b));
     }
   } else if (method === "step_up") {

@@ -32,7 +32,7 @@ export function sanitizeParams(input: unknown): SimParams {
   };
   const customers = Math.round(num(p.customers, DEFAULT_PARAMS.customers, 500, 10000));
   const marketSize = num(p.marketSize, 1_000_000, 10_000, 50_000_000);
-  const scenario = (typeof p.scenario === "string" && p.scenario in SCENARIOS ? p.scenario : "base") as ScenarioId;
+  const scenario = (typeof p.scenario === "string" && Object.hasOwn(SCENARIOS, p.scenario) ? p.scenario : "base") as ScenarioId;
   const inflation = p.inflation === undefined || p.inflation === null || p.inflation === "" ? undefined : num(p.inflation, 50, 0, 200);
   return {
     customers,

@@ -1,5 +1,6 @@
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { db } from "@/db";
+import { ApiError } from "@/lib/api";
 import { products, simulations } from "@/db/schema";
 import { analyzeResult } from "@/lib/engine/advisor";
 import { QUICK_PARAMS, simulatePortfolio } from "@/lib/engine/simulator";
@@ -11,8 +12,9 @@ let ready: Promise<void> | null = null;
 /** Self-healing schema (mirrors src/db/schema.ts) + first-run seeding with research-based templates. */
 export function ensureDb(): Promise<void> {
   if (!ready) {
-    ready = (async () => {
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS "products" (
+    ready = db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(731405)`);
+      await tx.execute(sql`CREATE TABLE IF NOT EXISTS "products" (
         "id" serial PRIMARY KEY NOT NULL,
         "name" text NOT NULL,
         "code" varchar(40) NOT NULL,
@@ -24,7 +26,7 @@ export function ensureDb(): Promise<void> {
         "created_at" timestamp with time zone DEFAULT now() NOT NULL,
         "updated_at" timestamp with time zone DEFAULT now() NOT NULL
       )`);
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS "simulations" (
+      await tx.execute(sql`CREATE TABLE IF NOT EXISTS "simulations" (
         "id" serial PRIMARY KEY NOT NULL,
         "product_id" integer NOT NULL,
         "type" varchar(24) NOT NULL,
@@ -34,13 +36,13 @@ export function ensureDb(): Promise<void> {
         "created_at" timestamp with time zone DEFAULT now() NOT NULL,
         CONSTRAINT "simulations_product_id_products_id_fk" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE cascade ON UPDATE no action
       )`);
-      const r = await db.select({ n: sql<number>`count(*)::int` }).from(products);
+      const r = await tx.select({ n: sql<number>`count(*)::int` }).from(products);
       if ((r[0]?.n ?? 0) === 0) {
         for (const key of SEED_TEMPLATE_KEYS) {
           const cfg = templateConfig(key);
           if (!cfg) continue;
           const full = analyzeResult(cfg, simulatePortfolio(cfg, QUICK_PARAMS));
-          await db.insert(products).values({
+          await tx.insert(products).values({
             name: cfg.name,
             code: cfg.code,
             family: cfg.family,
@@ -50,7 +52,7 @@ export function ensureDb(): Promise<void> {
           });
         }
       }
-    })().catch((e) => {
+    }).catch((e) => {
       ready = null;
       throw e;
     });
@@ -83,11 +85,10 @@ export async function listProducts(): Promise<ProductItem[]> {
   await ensureDb();
   const rows = await db.select().from(products).orderBy(desc(products.updatedAt));
   const sims = await db
-    .select({ id: simulations.id, productId: simulations.productId, type: simulations.type, scenario: simulations.scenario, summary: simulations.summary, createdAt: simulations.createdAt })
+    .selectDistinctOn([simulations.productId], { id: simulations.id, productId: simulations.productId, type: simulations.type, scenario: simulations.scenario, summary: simulations.summary, createdAt: simulations.createdAt })
     .from(simulations)
     .where(eq(simulations.type, "monte_carlo"))
-    .orderBy(desc(simulations.createdAt))
-    .limit(500);
+    .orderBy(simulations.productId, desc(simulations.createdAt), desc(simulations.id));
   const latest = new Map<number, SimSummary>();
   for (const s of sims) {
     if (!latest.has(s.productId)) {
@@ -104,7 +105,7 @@ export async function listProducts(): Promise<ProductItem[]> {
     healthScore: r.healthScore,
     status: r.status,
     updatedAt: r.updatedAt.toISOString(),
-    latest: latest.get(r.id) ?? null,
+    latest: latest.get(r.id) && new Date(latest.get(r.id)!.createdAt) >= r.updatedAt ? latest.get(r.id)! : null,
   }));
 }
 
@@ -161,6 +162,22 @@ export async function saveSimulation(productId: number, type: string, scenario: 
   return r.id;
 }
 
+/** Persist a result only for the exact configuration that was simulated. */
+export async function savePortfolioResult(productId: number, cfg: ProductConfig, full: FullResult): Promise<number> {
+  await ensureDb();
+  return db.transaction(async (tx) => {
+    const [row] = await tx.select().from(products).where(eq(products.id, productId)).for("update");
+    if (!row) throw new ApiError("محصول یافت نشد", 404);
+    if (JSON.stringify(normalizeConfig(row.config)) !== JSON.stringify(cfg)) {
+      throw new ApiError("محصول هنگام محاسبه تغییر کرده است؛ شبیه‌سازی را دوباره اجرا کنید.", 409);
+    }
+    const [saved] = await tx.insert(simulations).values({ productId, type: "monte_carlo", scenario: full.sim.params.scenario, summary: summarize(full), result: full }).returning({ id: simulations.id });
+    // Do not overwrite config or its edit timestamp with an old simulation snapshot.
+    await tx.update(products).set({ healthScore: full.health.score, status: "simulated" }).where(eq(products.id, productId));
+    return saved.id;
+  });
+}
+
 export async function listSimulations(productId: number): Promise<SimSummary[]> {
   await ensureDb();
   const rows = await db
@@ -177,7 +194,8 @@ export async function latestFullResult(productId: number): Promise<FullResult | 
   const [r] = await db
     .select({ result: simulations.result })
     .from(simulations)
-    .where(sql`${simulations.productId} = ${productId} and ${simulations.type} = 'monte_carlo'`)
+    .innerJoin(products, eq(products.id, simulations.productId))
+    .where(and(eq(simulations.productId, productId), eq(simulations.type, "monte_carlo"), gte(simulations.createdAt, products.updatedAt)))
     .orderBy(desc(simulations.createdAt))
     .limit(1);
   return r ? (r.result as FullResult) : null;

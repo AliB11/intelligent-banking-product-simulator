@@ -19,7 +19,6 @@ jobs:
     timeout-minutes: 15
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/app_db
-      NODE_ENV: test
     services:
       postgres:
         image: postgres:16
@@ -49,6 +48,9 @@ jobs:
 
       - name: همگام‌سازی schema روی PostgreSQL آزمایشی
         run: npx drizzle-kit push
+
+      - name: Engine and API regression tests
+        run: npm test
 
       - name: ESLint
         run: npm run lint
@@ -88,3 +90,5 @@ jobs:
           node -e 'const h=require("/tmp/simorgh-health.json"); if (!h.ok) process.exit(1); console.log("health: ok")'
           curl --fail --silent http://127.0.0.1:3000/api/products > /tmp/simorgh-products.json
           node -e 'const p=require("/tmp/simorgh-products.json"); if (!Array.isArray(p.items) || p.items.length < 1) process.exit(1); console.log(`products: ${p.items.length}`)'
+
+          SMOKE_BASE_URL=http://127.0.0.1:3000 npm run test:smoke
