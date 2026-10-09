@@ -1,4 +1,5 @@
 import Link from "next/link";
+import Launchpad from "@/components/Launchpad";
 import RandomIdeaButton from "@/components/RandomIdeaButton";
 import { listProducts, type ProductItem } from "@/db/repo";
 import { CBI, FAMILIES, KINDS } from "@/lib/engine/catalog";
@@ -18,7 +19,8 @@ export default async function Home() {
   try {
     items = await listProducts();
   } catch (e) {
-    dbError = e instanceof Error ? e.message : String(e);
+    console.error("Dashboard database unavailable", e);
+    dbError = "ارتباط با پایگاه داده برقرار نشد. طراحی و سفر مشتری در دسترس است؛ ذخیره‌سازی به اتصال پایگاه داده نیاز دارد.";
   }
   const simulated = items.filter((i) => i.latest).length;
   const avgHealth = items.length ? items.reduce((s, i) => s + (i.healthScore ?? 0), 0) / items.length : 0;
@@ -74,6 +76,8 @@ export default async function Home() {
           </div>
         </div>
       </section>
+
+      <Launchpad />
 
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
         {pipeline.map((p, i) => (

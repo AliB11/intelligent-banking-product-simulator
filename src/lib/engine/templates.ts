@@ -1,3 +1,4 @@
+import { CHANNELS, COLLATERALS, CONTRACTS, FAMILIES, KINDS, PURPOSES, REPAYMENTS, SEGMENTS } from "./catalog";
 import { mulberry32 } from "./math";
 import type { Channel, DeepPartial, Kind, ProductConfig, Segment } from "./types";
 
@@ -87,6 +88,7 @@ export function mergeConfig(base: ProductConfig, patch: DeepPartial<ProductConfi
   if (!patch) return out;
   const rec = (t: Record<string, unknown>, p: Record<string, unknown>) => {
     for (const key of Object.keys(p)) {
+      if (!Object.hasOwn(t, key) || ["__proto__", "constructor", "prototype"].includes(key)) continue;
       const v = p[key];
       if (v && typeof v === "object" && !Array.isArray(v)) {
         if (typeof t[key] !== "object" || t[key] === null) t[key] = {};
@@ -100,9 +102,41 @@ export function mergeConfig(base: ProductConfig, patch: DeepPartial<ProductConfi
   return out;
 }
 
+/** Whitelist structure and bound computational inputs; regulatory violations remain visible to the advisor. */
 export function normalizeConfig(input: unknown): ProductConfig {
-  if (!input || typeof input !== "object") return defaultConfig();
-  return mergeConfig(defaultConfig(), input as DeepPartial<ProductConfig>);
+  const defaults = defaultConfig();
+  const enums: Record<string, object> = { family: FAMILIES, kind: KINDS, contract: CONTRACTS, purpose: PURPOSES, segment: SEGMENTS, channel: CHANNELS, repayment: REPAYMENTS, collateral: COLLATERALS };
+  const limits: Record<string, [number, number]> = {
+    tenor: [1, 360], grace: [0, 60], minAmount: [1, 1e6], maxAmount: [1, 1e6], maxLoan: [1, 1e6],
+    minScore: [0, 900], maxAge: [18, 100], guarantors: [0, 10], coverage: [0, 1000],
+    coefficient: [0.01, 20], minHoldingDays: [0, 3650], expiryMonths: [0, 120],
+    opexPerAccount: [0, 1e6], acquisitionCost: [0, 1e6], pointsPer100k: [0, 10000], pointValue: [0, 1e6],
+    riskWeight: [0, 1000], targetRoe: [0, 200], interestFreeDays: [0, 365],
+    compensatingDeposit: [0, 90], downPayment: [0, 90],
+  };
+  const integers = new Set(["tenor", "grace", "minScore", "maxAge", "guarantors", "minHoldingDays", "expiryMonths", "interestFreeDays"]);
+  const clean = (base: Record<string, unknown>, raw: unknown): Record<string, unknown> => {
+    const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    return Object.fromEntries(Object.entries(base).map(([key, fallback]) => {
+      const v = Object.hasOwn(source, key) ? source[key] : undefined;
+      if (typeof fallback === "object" && fallback !== null) return [key, clean(fallback as Record<string, unknown>, v)];
+      if (typeof fallback === "number") {
+        const [lo, hi] = limits[key] ?? [0, 100];
+        const n = typeof v === "number" && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback;
+        return [key, integers.has(key) ? Math.round(n) : n];
+      }
+      if (typeof fallback === "boolean") return [key, typeof v === "boolean" ? v : fallback];
+      if (typeof v !== "string") return [key, fallback];
+      if (enums[key]) return [key, Object.hasOwn(enums[key], v) ? v : fallback];
+      if (key === "color") return [key, /^#[0-9a-f]{6}$/i.test(v) ? v : fallback];
+      const max = key === "description" ? 4000 : key === "code" ? 40 : key === "emoji" ? 16 : 200;
+      return [key, v.trim().slice(0, max) || fallback];
+    }));
+  };
+  const cfg = clean(defaults as unknown as Record<string, unknown>, input) as unknown as ProductConfig;
+  cfg.credit.minAmount = Math.min(cfg.credit.minAmount, cfg.credit.maxAmount);
+  if (!KINDS[cfg.kind].family.includes(cfg.family)) cfg.family = KINDS[cfg.kind].family[0];
+  return cfg;
 }
 
 export interface Template {

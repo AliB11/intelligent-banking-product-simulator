@@ -46,7 +46,12 @@ async function post<T>(url: string, body: unknown): Promise<T> {
 export default function Lab({ productId, config, initial, history: initialHistory }: { productId: number; config: ProductConfig; initial: FullResult | null; history: HistItem[] }) {
   const router = useRouter();
   const [cfg, setCfg] = useState<ProductConfig>(config);
-  const [params, setParams] = useState<UiParams>(DEFAULT_UI_PARAMS);
+  const [params, setParams] = useState<UiParams>(() => initial ? {
+    ...DEFAULT_UI_PARAMS,
+    ...initial.sim.params,
+    marketSize: initial.sim.params.customers * initial.sim.params.scale,
+    inflation: initial.sim.params.inflation ?? null,
+  } : DEFAULT_UI_PARAMS);
   const [result, setResult] = useState<FullResult | null>(initial);
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -106,6 +111,7 @@ export default function Lab({ productId, config, initial, history: initialHistor
       await saveConfig(mergeConfig(cfg, patch));
       setStress(null);
       setSens(null);
+      setOpt(null);
       await runSim();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -143,9 +149,16 @@ export default function Lab({ productId, config, initial, history: initialHistor
 
   const remove = async () => {
     if (!confirm("این محصول و همه شبیه‌سازی‌های آن حذف شود؟")) return;
-    await fetch(`/api/products/${productId}`, { method: "DELETE" });
-    router.push("/");
-    router.refresh();
+    setLoading("delete");
+    setError(null);
+    try {
+      const response = await fetch(`/api/products/${productId}`, { method: "DELETE" });
+      if (!response.ok) throw new Error("حذف محصول انجام نشد؛ دوباره تلاش کنید.");
+      router.push("/");
+      router.refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "خطای ارتباط با سرور");
+    } finally { setLoading(null); }
   };
 
   const exportJson = () => {
@@ -163,6 +176,11 @@ export default function Lab({ productId, config, initial, history: initialHistor
 
   const sim = result?.sim;
   const kp = sim?.kpis;
+  const stale = sim && (params.customers !== sim.params.customers || params.runs !== sim.params.runs ||
+    params.scenario !== sim.params.scenario || params.horizon !== sim.params.horizon ||
+    params.marketRate !== sim.params.marketRate || params.seed !== sim.params.seed ||
+    Math.abs(params.marketSize - sim.params.customers * sim.params.scale) > 0.01 ||
+    (params.inflation ?? null) !== (sim.params.inflation ?? null));
   const series = sim
     ? sim.series.map((s) => ({
         m: s.m,
@@ -207,7 +225,7 @@ export default function Lab({ productId, config, initial, history: initialHistor
               <Link href={`/persona?product=${productId}`} className="rounded-xl bg-white/15 px-3 py-2 text-center text-sm font-semibold hover:bg-white/25">🧭 سفر مشتری</Link>
               <button type="button" onClick={() => window.print()} className="rounded-xl bg-white/15 px-3 py-2 text-sm font-semibold hover:bg-white/25">🖨️ شناسنامه / PDF</button>
               <button type="button" onClick={exportJson} className="rounded-xl bg-white/15 px-3 py-2 text-sm font-semibold hover:bg-white/25">⬇️ خروجی JSON</button>
-              <button type="button" onClick={remove} className="rounded-xl bg-rose-500/30 px-3 py-2 text-sm font-semibold hover:bg-rose-500/50">🗑️ حذف</button>
+              <button type="button" onClick={remove} disabled={!!loading} className="rounded-xl bg-rose-500/30 px-3 py-2 text-sm font-semibold hover:bg-rose-500/50">🗑️ حذف</button>
             </div>
           </div>
         </div>
@@ -232,8 +250,14 @@ export default function Lab({ productId, config, initial, history: initialHistor
           </Btn>
         </div>
         <div className="mt-2 text-[11px] text-slate-500">{SCENARIOS[params.scenario].description}</div>
-        {error && <div className="mt-2 rounded-lg bg-rose-50 p-2 text-sm text-rose-700">{error}</div>}
+        {error && <div role="alert" className="mt-2 rounded-lg bg-rose-50 p-2 text-sm text-rose-700">{error}</div>}
       </Card>
+
+      {stale && <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+        <span>پارامترها تغییر کرده‌اند؛ نمودارهای فعلی هنوز مربوط به اجرای قبلی هستند.</span>
+        <Btn onClick={runSim} disabled={!!loading} variant="ghost">به‌روزرسانی نتایج</Btn>
+      </div>}
+      {loading && <p role="status" aria-live="polite" className="text-sm text-indigo-700">در حال پردازش… لطفاً تا تکمیل عملیات صبر کنید.</p>}
 
       <Tabs<TabKey>
         value={tab}

@@ -192,6 +192,8 @@ export function Toggle({ label, checked, onChange, hint }: { label: string; chec
     <button
       type="button"
       onClick={() => onChange(!checked)}
+      role="switch"
+      aria-checked={checked}
       className="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-right transition hover:border-indigo-300"
     >
       <span>
@@ -213,6 +215,7 @@ export function Tabs<T extends string>({ tabs, value, onChange }: { tabs: { key:
           key={t.key}
           type="button"
           onClick={() => onChange(t.key)}
+          aria-pressed={value === t.key}
           className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
             value === t.key ? "bg-white text-indigo-700 shadow" : "text-slate-600 hover:text-slate-900"
           }`}

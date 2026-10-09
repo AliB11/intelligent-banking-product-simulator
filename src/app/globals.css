@@ -82,3 +82,28 @@ input[type="range"] {
     break-inside: avoid;
   }
 }
+
+:focus-visible {
+  outline: 3px solid #0d9488;
+  outline-offset: 4px;
+}
+.skip-link {
+  position: fixed;
+  top: -100px;
+  right: 16px;
+  z-index: 100;
+  border-radius: 12px;
+  background: white;
+  color: #0f172a;
+  padding: 12px 20px;
+}
+.skip-link:focus { top: 12px; }
+::selection { background: #ccfbf1; color: #134e4a; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

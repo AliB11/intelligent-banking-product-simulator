@@ -1,3 +1,4 @@
+import { apiFailure, readBody } from "@/lib/api";
 import { getProduct, saveSimulation } from "@/db/repo";
 import { runOptimizer, runSensitivity, runStress } from "@/lib/engine/analysis";
 import { normalizeConfig } from "@/lib/engine/templates";
@@ -10,7 +11,7 @@ const OBJECTIVES: Objective[] = ["profit", "raroc", "inclusion", "balanced"];
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json().catch(() => ({}))) as {
+    const body = (await readBody(req)) as {
       productId?: number;
       config?: unknown;
       params?: unknown;
@@ -20,7 +21,7 @@ export async function POST(req: Request) {
     const params = sanitizeParams(body.params);
     let cfg: ProductConfig;
     let productId: number | null = null;
-    if (body.productId) {
+    if (body.productId !== undefined) {
       const p = await getProduct(Number(body.productId));
       if (!p) return Response.json({ error: "محصول یافت نشد" }, { status: 404 });
       cfg = p.config;
@@ -60,6 +61,6 @@ export async function POST(req: Request) {
     }
     return Response.json({ error: "حالت تحلیل نامعتبر است" }, { status: 400 });
   } catch (e) {
-    return Response.json({ error: String(e) }, { status: 500 });
+    return apiFailure(e);
   }
 }

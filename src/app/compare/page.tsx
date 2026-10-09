@@ -39,17 +39,18 @@ export default function ComparePage() {
   const [results, setResults] = useState<Record<number, FullResult>>({});
   const [running, setRunning] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/products")
-      .then((r) => r.json())
+      .then((r) => { if (!r.ok) throw new Error("دریافت محصولات ناموفق بود. اتصال سرور را بررسی و صفحه را تازه‌سازی کنید."); return r.json(); })
       .then((j: { items?: Item[] }) => {
         const list = j.items ?? [];
         setItems(list);
         setSel(list.slice(0, 3).map((i) => i.id));
         setLoaded(true);
       })
-      .catch(() => setLoaded(true));
+      .catch((e) => { setError(e instanceof Error ? e.message : "خطای ارتباط"); setLoaded(true); });
   }, []);
 
   useEffect(() => {
@@ -91,7 +92,8 @@ export default function ComparePage() {
 
       <Card title="انتخاب محصولات" icon="✅" actions={running ? <span className="flex items-center gap-1 text-xs text-indigo-600"><span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-indigo-200 border-t-indigo-600" /> محاسبه…</span> : null}>
         {!loaded && <div className="py-4 text-center text-sm text-slate-500"><Spinner /> بارگذاری…</div>}
-        {loaded && items.length === 0 && (
+        {error && <p role="alert" className="rounded-xl bg-rose-50 p-4 text-sm text-rose-700">{error}</p>}
+        {loaded && !error && items.length === 0 && (
           <div className="py-4 text-center text-sm text-slate-500">محصولی وجود ندارد. <Link href="/studio" className="text-indigo-600">طراحی کنید</Link></div>
         )}
         <div className="flex flex-wrap gap-2">

@@ -21,7 +21,8 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
   const [cfg, setCfg] = useState<ProductConfig>(initial);
   const [tab, setTab] = useState<TabKey>("identity");
   const [preview, setPreview] = useState<FullResult | null>(null);
-  const [computing, setComputing] = useState(true);
+  const [previewConfig, setPreviewConfig] = useState<ProductConfig | null>(null);
+  const computing = previewConfig !== cfg;
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [nameSeed, setNameSeed] = useState(7);
@@ -29,12 +30,13 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
   const [calcDays, setCalcDays] = useState(180);
 
   useEffect(() => {
-    setComputing(true);
     const t = setTimeout(() => {
       try {
         setPreview(analyzeResult(cfg, simulatePortfolio(cfg, QUICK_PARAMS)));
+      } catch {
+        setError("محاسبه پیش‌نمایش انجام نشد؛ ورودی‌ها را بررسی کنید.");
       } finally {
-        setComputing(false);
+        setPreviewConfig(cfg);
       }
     }, 280);
     return () => clearTimeout(t);

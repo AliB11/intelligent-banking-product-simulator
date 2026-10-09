@@ -13,6 +13,7 @@ import type {
   ProductConfig,
   ScenarioId,
   SimParams,
+  SimResult,
   StressRow,
   TornadoItem,
 } from "./types";
@@ -21,17 +22,22 @@ const NF = [0, 1, 2].map((d) => new Intl.NumberFormat("fa-IR", { maximumFraction
 const fa = (v: number, d = 1) => NF[Math.min(2, Math.max(0, d))].format(v);
 const clone = (c: ProductConfig) => mergeConfig(c, {});
 
+/** Preserve the represented market when reducing the synthetic sample. */
+export function resampleParams(base: SimParams, cap: number): SimParams {
+  const customers = Math.min(base.customers, cap);
+  return { ...base, customers, scale: base.scale * base.customers / customers };
+}
+
 // ======================= Stress testing =======================
 export function runStress(cfg: ProductConfig, base: SimParams): StressRow[] {
   const ids = Object.keys(SCENARIOS) as ScenarioId[];
   return ids.map((id) => {
     const s = SCENARIOS[id];
     const sim = simulatePortfolio(cfg, {
-      ...base,
+      ...resampleParams(base, 3000),
       scenario: id,
       inflation: undefined,
       runs: Math.min(base.runs, 12),
-      customers: Math.min(base.customers, 3000),
     });
     return {
       id,
@@ -60,7 +66,7 @@ interface SensVar {
 }
 
 export function runSensitivity(cfg: ProductConfig, base: SimParams): TornadoItem[] {
-  const fast: SimParams = { ...base, runs: Math.min(base.runs, 6), customers: Math.min(base.customers, 2500) };
+  const fast: SimParams = { ...resampleParams(base, 2500), runs: Math.min(base.runs, 6) };
   const baseProfit = simulatePortfolio(cfg, fast).kpis.netProfit;
   const k = cfg.kind;
   const vars: SensVar[] = [];
@@ -230,8 +236,8 @@ interface Cand {
   y: number;
 }
 
-function evaluate(cfg: ProductConfig, params: SimParams, objective: Objective): Omit<Cand, "cfg"> {
-  const sim = simulatePortfolio(cfg, params);
+function evaluate(cfg: ProductConfig, params: SimParams, objective: Objective, result?: SimResult): Omit<Cand, "cfg"> {
+  const sim = result ?? simulatePortfolio(cfg, params);
   const comp = checkCompliance(cfg);
   const kp = sim.kpis;
   let score: number;
@@ -252,7 +258,7 @@ function evaluate(cfg: ProductConfig, params: SimParams, objective: Objective): 
 }
 
 export function runOptimizer(cfg: ProductConfig, base: SimParams, objective: Objective): OptimizerResult {
-  const params: SimParams = { ...base, customers: Math.min(base.customers, 1200), runs: 3 };
+  const params: SimParams = { ...resampleParams(base, 1200), runs: Math.min(base.runs, 3) };
   const rng = mulberry32(base.seed * 3 + 11);
   const vars = varsFor(cfg);
   const evals: Cand[] = [];
@@ -287,7 +293,7 @@ export function runOptimizer(cfg: ProductConfig, base: SimParams, objective: Obj
   }
   pool.sort(cmp);
   const best = pool[0];
-  const finalParams: SimParams = { ...base, runs: Math.min(base.runs, 10), customers: Math.min(base.customers, 3000) };
+  const finalParams: SimParams = { ...resampleParams(base, 3000), runs: Math.min(base.runs, 10) };
   const bestFull = simulatePortfolio(best.cfg, finalParams);
   const baseFull = simulatePortfolio(cfg, finalParams);
   const changes = vars
@@ -301,8 +307,8 @@ export function runOptimizer(cfg: ProductConfig, base: SimParams, objective: Obj
   return {
     objective,
     evaluations: evals.length,
-    baseline: { score: baseline.score, kpis: baseFull.kpis },
-    best: { score: best.score, kpis: bestFull.kpis, config: best.cfg },
+    baseline: { score: evaluate(cfg, finalParams, objective, baseFull).score, kpis: baseFull.kpis },
+    best: { score: evaluate(best.cfg, finalParams, objective, bestFull).score, kpis: bestFull.kpis, config: best.cfg },
     changes,
     points,
     xLabel: cfg.kind === "loyalty" ? "اعضای جذب‌شده (هزار نفر)" : "مشتریان تأییدشده (هزار نفر)",
