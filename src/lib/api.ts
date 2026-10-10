@@ -8,7 +8,8 @@ export function productId(value: unknown): number {
   if (!Number.isSafeInteger(id) || id < 1 || id > 2147483647) throw new ApiError("شناسه محصول نامعتبر است");
   return id;
 }
-export async function readBody(req: Request, requireConfig = false): Promise<Record<string, unknown>> {
+/** Reads a bounded (64 KB) JSON object body. */
+export async function readJsonObject(req: Request): Promise<Record<string, unknown>> {
   const reader = req.body?.getReader();
   if (!reader) throw new ApiError("بدنه درخواست الزامی است");
   const chunks: Uint8Array[] = [];
@@ -26,6 +27,10 @@ export async function readBody(req: Request, requireConfig = false): Promise<Rec
   try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
   catch { throw new ApiError("ساختار JSON نامعتبر است"); }
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError("بدنه درخواست باید یک شیء باشد");
+  return body as Record<string, unknown>;
+}
+export async function readBody(req: Request, requireConfig = false): Promise<Record<string, unknown>> {
+  const body = await readJsonObject(req);
   const b = body as Record<string, unknown>;
   if (b.productId !== undefined) productId(b.productId);
   if (b.config !== undefined && (!b.config || typeof b.config !== "object" || Array.isArray(b.config))) throw new ApiError("پیکربندی نامعتبر است");

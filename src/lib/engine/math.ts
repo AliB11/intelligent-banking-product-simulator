@@ -1,4 +1,4 @@
-import type { ProductConfig, Repayment } from "./types";
+import type { ProductConfig, Repayment, TieredMurabahaTier } from "./types";
 
 // ---------- Random ----------
 export type Rng = () => number;
@@ -267,12 +267,45 @@ export function effectiveApr(
   return (Math.pow(1 + r, 12) - 1) * 100;
 }
 
+/** True when a points product uses the multi-tier (Negin-style) murabaha menu. */
+export function isTieredPoints(cfg: ProductConfig): boolean {
+  return cfg.kind === "points_loan" && cfg.points.mode === "tiered_murabaha" && cfg.points.tiers.length > 0;
+}
+
+/**
+ * Contract-aware price of a simple points loan: a qard loan charges the qard fee (≤ 4%),
+ * an exchange contract (e.g. murabaha) charges the credit profit rate.
+ */
+export function pointsLoanRate(cfg: ProductConfig): number {
+  return cfg.contract === "qard" ? cfg.points.loanFee : cfg.credit.rate;
+}
+
+/** Upfront fee applied to a points loan (qard loans are priced through the fee rate only). */
+export function pointsUpfrontFee(cfg: ProductConfig): number {
+  return cfg.contract === "qard" ? 0 : cfg.credit.upfrontFee;
+}
+
+/** Normalised selection weights of the tiers (falls back to equal weights). */
+export function tierWeights(tiers: TieredMurabahaTier[]): number[] {
+  const w = tiers.map((t) => Math.max(0, t.expectedTakeUpShare));
+  const s = sum(w);
+  return s > 0 ? w.map((x) => x / s) : tiers.map(() => 1 / Math.max(1, tiers.length));
+}
+
 /** Effective annual cost to the customer for a representative contract. */
 export function aprFor(cfg: ProductConfig): number {
   const cr = cfg.credit;
   if (cfg.kind === "loyalty") return 0;
   if (cfg.kind === "points_loan") {
-    return effectiveApr(100, cfg.points.loanFee, cr.tenor, 0, "annuity", 0, 0, 0, cr.insurance, 0);
+    const fee = pointsUpfrontFee(cfg);
+    if (isTieredPoints(cfg)) {
+      const w = tierWeights(cfg.points.tiers);
+      return cfg.points.tiers.reduce(
+        (s, t, i) => s + w[i] * effectiveApr(100, t.rate, Math.max(1, Math.round(t.repaymentMonths)), 0, "annuity", 0, 0, fee, cr.insurance, 0),
+        0,
+      );
+    }
+    return effectiveApr(100, pointsLoanRate(cfg), cr.tenor, 0, "annuity", 0, 0, fee, cr.insurance, 0);
   }
   if (cfg.kind === "credit_card" || cfg.kind === "credit_line") {
     const eff = (Math.pow(1 + cr.rate / 1200, 12) - 1) * 100;

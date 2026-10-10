@@ -1,6 +1,30 @@
 import { CHANNELS, COLLATERALS, CONTRACTS, FAMILIES, KINDS, PURPOSES, REPAYMENTS, SEGMENTS } from "./catalog";
 import { mulberry32 } from "./math";
-import type { Channel, DeepPartial, Kind, ProductConfig, Segment } from "./types";
+import type { Channel, DeepPartial, Kind, ProductConfig, Segment, TieredMurabahaTier } from "./types";
+
+/** Hard limits for a tier menu (bounded to keep ALM/simulation cost predictable). */
+export const MAX_TIERS = 12;
+
+/** Whitelist and bound one tier of a tiered points product. Returns null for non-object input. */
+export function sanitizeTier(raw: unknown, index: number): TieredMurabahaTier | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const num = (v: unknown, d: number, lo: number, hi: number, int = false) => {
+    const n = typeof v === "number" && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d;
+    return int ? Math.round(n) : n;
+  };
+  const tier: TieredMurabahaTier = {
+    name: typeof r.name === "string" && r.name.trim() ? r.name.trim().slice(0, 60) : `حالت ${index + 1}`,
+    waitingMonths: num(r.waitingMonths, 2, 0, 60, true),
+    repaymentMonths: num(r.repaymentMonths, 16, 1, 360, true),
+    loanToAvgDepositPct: num(r.loanToAvgDepositPct, 25, 0, 1000),
+    rate: num(r.rate, 23, 0, 100),
+    minAvgDeposit: num(r.minAvgDeposit, 0, 0, 1e6),
+    expectedTakeUpShare: num(r.expectedTakeUpShare, 0, 0, 100),
+  };
+  if (typeof r.id === "string" && /^[\w-]{1,24}$/.test(r.id)) tier.id = r.id;
+  return tier;
+}
 
 export function defaultConfig(): ProductConfig {
   return {
@@ -142,13 +166,28 @@ export function normalizeConfig(input: unknown): ProductConfig {
     opexPerAccount: [0, 1e6], acquisitionCost: [0, 1e6], pointsPer100k: [0, 10000], pointValue: [0, 1e6],
     riskWeight: [0, 1000], targetRoe: [0, 200], interestFreeDays: [0, 365],
     compensatingDeposit: [0, 90], downPayment: [0, 90],
+    // prices, fees and behavioural shares are percentages: physically bounded, regulatory caps stay visible to the advisor
+    rate: [0, 100], upfrontFee: [0, 100], annualFee: [0, 100], insurance: [0, 100], merchantFee: [0, 100],
+    revolvingShare: [0, 100], utilization: [0, 100], prepayDiscount: [0, 100], latePenaltySpread: [0, 100],
+    maxDti: [0, 100], collectionsIntensity: [0, 100], stepUp: [0, 100], balloon: [0, 90],
+    costOfFunds: [0, 200], targetCar: [0, 100], taxRate: [0, 90], reserveRatio: [0, 100],
+    depositRate: [0, 100], loanFee: [0, 100], usageRate: [0, 100], individualLoanCap: [1, 1e6], minOpeningDeposit: [0, 1e6],
+    alphaStepPerWaitMonth: [0, 200], tenorStepPerWaitMonth: [0, 60], rateCutPerWaitMonth: [0, 50],
+    maxAmountBoostMonths: [0, 24], maxTenorBoostMonths: [0, 24], maxRateCutMonths: [0, 24],
+    breakage: [0, 100], partnerShare: [0, 100], spendUplift: [0, 500], balanceUplift: [0, 500], churnReduction: [0, 100],
+    baseRate: [0, 100], sensitivityToRateGap: [0, 20], maxRate: [0, 100],
+    pointsPerExtraWaitMonth: [0, 1e5], lotteryChancePerMonth: [0, 100], topTierFeeDiscount: [0, 100],
+    fastLoanRate: [0, 100], fastLoanAlphaPct: [0, 1000], fastLoanTenor: [1, 360],
   };
-  const integers = new Set(["tenor", "grace", "minScore", "maxAge", "guarantors", "minHoldingDays", "expiryMonths", "interestFreeDays"]);
+  const integers = new Set([
+    "tenor", "grace", "minScore", "maxAge", "guarantors", "minHoldingDays", "expiryMonths", "interestFreeDays",
+    "maxAmountBoostMonths", "maxTenorBoostMonths", "maxRateCutMonths", "fastLoanTenor",
+  ]);
   const clean = (base: any, raw: unknown): any => {
-    // مدیریت آرایه‌ها: آرایه ورودی را استفاده کن، در غیر این صورت از پایه استفاده کن
+    // the only array in the schema is points.tiers: every element is whitelisted and bounded
     if (Array.isArray(base)) {
-      if (Array.isArray(raw)) return raw;
-      return base;
+      if (!Array.isArray(raw)) return base;
+      return raw.slice(0, MAX_TIERS).map(sanitizeTier).filter((t): t is TieredMurabahaTier => t !== null);
     }
     const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
     return Object.fromEntries(Object.entries(base).map(([key, fallback]) => {
@@ -359,7 +398,7 @@ export const TEMPLATES: Template[] = [
       description:
         "سپرده کوتاه‌مدت ماه‌شمار ویژه با سود ۰.۰۱٪؛ دوره انتظار ۲ تا ۱۲ ماه، ضریب تسهیلات ۲۵٪ تا ۲۰۰٪ میانگین، نرخ سود ۵٪ تا ۲۳٪ و اقساط ۱۶/۲۴/۳۲/۴۰/۴۸/۵۶/۶۰ ماه. به ازای هر ماه انتظار اضافی مشتری یکی از سه گزینه افزایش مبلغ (+۲۵٪)، افزایش اقساط (+۸ماه) یا کاهش سود (-۲٪) را انتخاب می‌کند — حدود ۲۵۰ ترکیب. این الگو به موتور کامل ALM، تحلیل نقدینگی، گیمیفیکیشن سفر انتظار، ریسک پیش‌پرداخت و تسهیلات ضدنگین (فوری) تجهیز شده است.",
       credit: {
-        rate: 13,
+        rate: 18, // فقط مرجع حالت ساده؛ در حالت چندپله‌ای نرخ هر پله اعمال می‌شود (میانگین وزنی ≈ ۱۷.۸٪)
         upfrontFee: 1,
         annualFee: 0,
         insurance: 0,
@@ -420,7 +459,8 @@ export const TEMPLATES: Template[] = [
         ],
       },
       funding: {
-        costOfFunds: 0.15,
+        // FTP = بهای فرصت وجوه برای بانک (نه نرخ سود سپرده ۰.۰۱٪)؛ ارزش منابع ارزان = FTP − نرخ سپرده
+        costOfFunds: 20,
         opexPerAccount: 30,
         acquisitionCost: 90,
         riskWeight: 75,

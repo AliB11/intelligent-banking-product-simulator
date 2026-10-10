@@ -148,7 +148,7 @@ export interface NeginCustomerOption {
   opportunityCost: number;
   /** کل هزینه مؤثر برای مشتری (کل بازپرداخت + هزینه فرصت - سود سپرده) */
   effectiveCustomerCost: number;
-  /** IRR مؤثر سالانه سود بانک */
+  /** بازده مؤثر سالانه بانک (IRR) با احتساب ارزش منابع ارزان دوره انتظار و زیان مورد انتظار */
   bankEffectiveYield: number;
   /** امتیاز مطلوبیت مشتری (۰ تا ۱۰۰) */
   customerUtility: number;
@@ -302,6 +302,14 @@ export interface Kpis {
   avgOutstanding: number;
   roa: number;
   raroc: number;
+  /** RAROC excluding the deposit-franchise (FTP) benefit — pure credit economics (points products) */
+  rarocCredit: number;
+  /** RAROC after the HQLA-buffer cost and with liquidity capital in the denominator (points products) */
+  rarocLiquidity: number;
+  /** cost of holding the HQLA buffer over the horizon (billion toman) */
+  liquidityCost: number;
+  /** capital held against a stressed deposit run-off (billion toman) */
+  liquidityCapital: number;
   economicCapital: number;
   regulatoryCapital: number;
   nim: number;
@@ -452,15 +460,6 @@ export interface StressRow {
   volume: number;
 }
 
-export interface TornadoItem {
-  key: string;
-  label: string;
-  lowLabel: string;
-  highLabel: string;
-  low: number;
-  high: number;
-  base: number;
-}
 
 export interface OptimizerPoint {
   x: number;
@@ -513,6 +512,8 @@ export interface AlmMonthRow {
   withdrawalOut: number;
   profitPaid: number;
   fundingCost: number;
+  /** درآمد سرمایه‌گذاری مازاد نقد ماه قبل با نرخ FTP */
+  surplusIncome: number;
   provisionCost: number;
   writeOff: number;
   outflow: number;
@@ -541,13 +542,17 @@ export interface AlmTierResult {
   totalRepay: number;
   totalIncome: number;
   borrowers: number;
+  /** تعداد سپرده‌گذاران این پله */
+  customers?: number;
+  /** نخستین ماه دریافت قسط (null اگر وام در افق اعطا نشود) */
   firstMaturity: number | null;
   lastMaturity: number | null;
   unitPay: number;
   customerOpportunityCost: number;
   customerEffectiveCost: number;
+  /** هزینه تمام‌شده سالانه مشتری (IRR) با احتساب هزینه فرصت سپرده‌گذاری (%) */
   customerIrr: number;
-  /** شکاف منافع مشتری-بانک (مثبت یعنی به نفع بانک، منفی یعنی به نفع مشتری) */
+  /** هزینه تمام‌شده مشتری منهای نرخ فرصت بازار (مثبت = محصول برای مشتری گران‌تر از بازار) */
   interestGap: number;
 }
 
@@ -569,6 +574,8 @@ export interface AlmKpis {
   totalIncomeInHorizon: number;
   pmtBeyondHorizon: number;
   interbankCost: number;
+  /** جمع درآمد سرمایه‌گذاری مازاد نقد در افق (میلیارد تومان) */
+  surplusIncome: number;
   borrowers: number;
   peakOutflow: number;
   peakOutflowMonth: number;
@@ -614,6 +621,7 @@ export interface TornadoItem {
   low: number;
   high: number;
   base: number;
+  /** دامنه نوسان = max(low, high, base) − min(low, high, base) */
   swing: number;
 }
 
@@ -629,6 +637,8 @@ export interface AlmAnalysisResult {
     p95: number;
     p99: number;
     worstCaseMaxHole: number;
+    /** نمونه‌های مرتب‌شده حداکثر حفره (برای هیستوگرام) */
+    samples?: number[];
   };
   optimalTierDesign?: {
     tiers: TieredMurabahaTier[];
@@ -699,6 +709,8 @@ export interface FullAlmResult {
     fastLoanVolume: number;
     fastLoanIncome: number;
     holeCoverageByFastLoans: number;
+    /** مانده نقد خالص جریان ضدنگین در ماه کف نقدینگی طرح پایه (میلیارد تومان؛ منفی = مصرف نقدینگی) */
+    cashAtTrough?: number;
   };
   gamificationJourney?: GameTierResult[];
 }

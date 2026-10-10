@@ -195,9 +195,18 @@ function varsFor(cfg: ProductConfig): OptVar[] {
     v.push({ key: "behavioral", label: "پایش رفتاری", type: "bool", get: (c) => c.risk.behavioral, set: (c, x) => { c.risk.behavioral = Boolean(x); }, fmt: boolFmt });
     v.push({ key: "channel", label: "کانال", type: "choice", choices: k === "bnpl" ? ["embedded", "digital", "omni"] : ["digital", "omni", "branch"], get: (c) => c.channel, set: (c, x) => { c.channel = x as Channel; }, fmt: (x) => CHANNELS[x as Channel]?.label ?? String(x) });
   }
-  if (k === "points_loan") {
+  if (k === "points_loan" && cfg.points.mode === "tiered_murabaha" && cfg.points.tiers.length > 0) {
+    // tiered menu: price/tenor/α live in the tiers, coefficient/fee/minHold/tenor knobs would be no-ops
+    v.push({ key: "maxLoan", label: "سقف وام امتیازی", type: "num", min: 100, max: 500, step: 50, get: (c) => c.points.maxLoan, set: (c, x) => { c.points.maxLoan = Number(x); }, fmt: numFmt });
+    v.push({ key: "pminScore", label: "حد نصاب امتیاز", type: "num", min: 400, max: 650, step: 10, get: (c) => c.risk.minScore, set: (c, x) => { c.risk.minScore = Number(x); }, fmt: numFmt });
+    v.push({ key: "transfer", label: "انتقال امتیاز", type: "bool", get: (c) => c.points.transferable, set: (c, x) => { c.points.transferable = Boolean(x); }, fmt: boolFmt });
+  } else if (k === "points_loan") {
     v.push({ key: "coef", label: "ضریب تبدیل امتیاز", type: "num", min: 1.2, max: 3.6, step: 0.1, get: (c) => c.points.coefficient, set: (c, x) => { c.points.coefficient = Math.round(Number(x) * 10) / 10; }, fmt: numFmt });
-    v.push({ key: "loanFee", label: "کارمزد وام", type: "num", min: 0, max: 4, step: 0.5, get: (c) => c.points.loanFee, set: (c, x) => { c.points.loanFee = Number(x); }, fmt: pctFmt });
+    if (cfg.contract === "qard") {
+      v.push({ key: "loanFee", label: "کارمزد وام", type: "num", min: 0, max: 4, step: 0.5, get: (c) => c.points.loanFee, set: (c, x) => { c.points.loanFee = Number(x); }, fmt: pctFmt });
+    } else {
+      v.push({ key: "prate", label: "نرخ سود وام", type: "num", min: 5, max: 23, step: 1, get: (c) => c.credit.rate, set: (c, x) => { c.credit.rate = Number(x); }, fmt: pctFmt });
+    }
     v.push({ key: "minHold", label: "حداقل دوره نگهداری (روز)", type: "num", min: 30, max: 180, step: 15, get: (c) => c.points.minHoldingDays, set: (c, x) => { c.points.minHoldingDays = Number(x); }, fmt: numFmt });
     v.push({ key: "maxLoan", label: "سقف وام امتیازی", type: "num", min: 100, max: 500, step: 50, get: (c) => c.points.maxLoan, set: (c, x) => { c.points.maxLoan = Number(x); }, fmt: numFmt });
     v.push({ key: "ptenor", label: "دوره بازپرداخت (ماه)", type: "num", min: 12, max: 60, step: 6, get: (c) => c.credit.tenor, set: (c, x) => { c.credit.tenor = Number(x); }, fmt: numFmt });
@@ -296,10 +305,22 @@ export function runOptimizer(cfg: ProductConfig, base: SimParams, objective: Obj
     }
   }
   pool.sort(cmp);
-  const best = pool[0];
   const finalParams: SimParams = { ...resampleParams(base, 3000), runs: Math.min(base.runs, 10) };
-  const bestFull = simulatePortfolio(best.cfg, finalParams);
   const baseFull = simulatePortfolio(cfg, finalParams);
+  const baseEval = evaluate(cfg, finalParams, objective, baseFull);
+  // re-check the top candidates on the larger sample: the search sample is noisy, so never recommend
+  // a design that turns out worse than (or less compliant than) the current one
+  let best: Cand = { cfg, ...baseEval };
+  let bestFull = baseFull;
+  for (const cand of pool.slice(0, 3)) {
+    if (cand.cfg === baseline.cfg) continue;
+    const full = simulatePortfolio(cand.cfg, finalParams);
+    const ev: Cand = { cfg: cand.cfg, ...evaluate(cand.cfg, finalParams, objective, full) };
+    if (cmp(ev, best) < 0) {
+      best = ev;
+      bestFull = full;
+    }
+  }
   const changes = vars
     .filter((v) => String(v.get(cfg)) !== String(v.get(best.cfg)))
     .map((v) => ({ label: v.label, from: v.fmt(v.get(cfg)), to: v.fmt(v.get(best.cfg)) }));
@@ -311,8 +332,8 @@ export function runOptimizer(cfg: ProductConfig, base: SimParams, objective: Obj
   return {
     objective,
     evaluations: evals.length,
-    baseline: { score: evaluate(cfg, finalParams, objective, baseFull).score, kpis: baseFull.kpis },
-    best: { score: evaluate(best.cfg, finalParams, objective, bestFull).score, kpis: bestFull.kpis, config: best.cfg },
+    baseline: { score: baseEval.score, kpis: baseFull.kpis },
+    best: { score: best.score, kpis: bestFull.kpis, config: best.cfg },
     changes,
     points,
     xLabel: cfg.kind === "loyalty" ? "اعضای جذب‌شده (هزار نفر)" : "مشتریان تأییدشده (هزار نفر)",

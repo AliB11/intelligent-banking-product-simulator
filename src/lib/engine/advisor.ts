@@ -74,14 +74,31 @@ export function checkCompliance(cfg: ProductConfig): ComplianceReport {
 
   if (isPoints) {
     const pt = cfg.points;
-    if (cfg.contract !== "qard") add("pts_contract", "warn", "عقد وام امتیازی", "طرح‌های امتیازی سپرده‌محور معمولاً بر پایه قرض‌الحسنه‌اند.", "رویه بانک‌های قرض‌الحسنه");
-    if (pt.loanFee > CBI.qardFeeCap) add("pts_fee", "fail", "کارمزد وام امتیازی", `کارمزد ${fa(pt.loanFee)}٪ از سقف ۴٪ بیشتر است.`, "ضوابط قرض‌الحسنه");
-    else add("pts_fee", "pass", "کارمزد وام امتیازی", `کارمزد ${fa(pt.loanFee)}٪ (حداکثر ۴٪).`, "ضوابط قرض‌الحسنه");
-    if (pt.depositRate > 0) add("pts_deprate", "warn", "سود حساب قرض‌الحسنه", "حساب قرض‌الحسنه سود قطعی ندارد؛ فقط جوایز و امتیاز مجاز است.", "قانون عملیات بانکی بدون ربا");
-    else add("pts_deprate", "pass", "ماهیت حساب", "حساب قرض‌الحسنه بدون سود؛ پاداش در قالب امتیاز وام.", "قانون عملیات بانکی بدون ربا");
-    if (Math.min(cfg.credit.maxAmount, pt.maxLoan) > CBI.qardBankCap) add("pts_cap", "warn", "سقف تسهیلات قرض‌الحسنه", `سقف ${fa(Math.min(cfg.credit.maxAmount, pt.maxLoan), 0)} میلیون از ۵۰۰ میلیون تومان (بانک‌های قرض‌الحسنه) فراتر است.`, "بانک مرکزی");
+    const qard = cfg.contract === "qard";
+    const tiered = pt.mode === "tiered_murabaha" && pt.tiers.length > 0;
+    if (!qard) add("pts_contract", "info", "عقد وام امتیازی", `وام امتیازی بر پایه «${ct.label}» است؛ سقف نرخ عقود مبادله‌ای (۲۳٪) به‌جای سقف کارمزد قرض‌الحسنه اعمال می‌شود.`, "مصوبه شورای پول و اعتبار");
+    if (qard) {
+      if (pt.loanFee > CBI.qardFeeCap) add("pts_fee", "fail", "کارمزد وام امتیازی", `کارمزد ${fa(pt.loanFee)}٪ از سقف ۴٪ بیشتر است.`, "ضوابط قرض‌الحسنه");
+      else add("pts_fee", "pass", "کارمزد وام امتیازی", `کارمزد ${fa(pt.loanFee)}٪ (حداکثر ۴٪).`, "ضوابط قرض‌الحسنه");
+    } else {
+      const rates = tiered ? pt.tiers.map((t) => t.rate) : [cr.rate];
+      const top = Math.max(...rates);
+      if (top > CBI.loanRateCap) add("pts_rate", "fail", "سقف نرخ وام امتیازی", `${tiered ? "بالاترین نرخ پله‌ها" : "نرخ"} ${fa(top)}٪ از سقف ۲۳٪ بیشتر است.`, "مصوبه شورای پول و اعتبار (۲۳٪)");
+      else add("pts_rate", "pass", "سقف نرخ وام امتیازی", `${tiered ? `نرخ پله‌ها ${fa(Math.min(...rates))} تا ${fa(top)}٪` : `نرخ ${fa(top)}٪`} ≤ ۲۳٪.`, "مصوبه شورای پول و اعتبار (۲۳٪)");
+    }
+    if (qard) {
+      if (pt.depositRate > 0) add("pts_deprate", "warn", "سود حساب قرض‌الحسنه", "حساب قرض‌الحسنه سود قطعی ندارد؛ فقط جوایز و امتیاز مجاز است.", "قانون عملیات بانکی بدون ربا");
+      else add("pts_deprate", "pass", "ماهیت حساب", "حساب قرض‌الحسنه بدون سود؛ پاداش در قالب امتیاز وام.", "قانون عملیات بانکی بدون ربا");
+      if (Math.min(cfg.credit.maxAmount, pt.maxLoan) > CBI.qardBankCap) add("pts_cap", "warn", "سقف تسهیلات قرض‌الحسنه", `سقف ${fa(Math.min(cfg.credit.maxAmount, pt.maxLoan), 0)} میلیون از ۵۰۰ میلیون تومان (بانک‌های قرض‌الحسنه) فراتر است.`, "بانک مرکزی");
+    }
+    if (tiered) {
+      const bad = pt.tiers.filter((t) => t.waitingMonths < 1 || t.repaymentMonths < 1 || t.loanToAvgDepositPct <= 0);
+      if (bad.length) add("pts_tiers", "warn", "پله‌های نامعتبر", `${fa(bad.length, 0)} پله با انتظار/دوره/ضریب صفر تعریف شده است.`, "طراحی محصول");
+      const share = pt.tiers.reduce((a, t) => a + t.expectedTakeUpShare, 0);
+      if (Math.abs(share - 100) > 1) add("pts_share", "info", "جمع سهم انتخاب پله‌ها", `جمع سهم‌ها ${fa(share, 0)}٪ است؛ مدل آن را به ۱۰۰٪ نرمال می‌کند.`, "طراحی محصول");
+    }
     if (pt.transferable) add("pts_transfer", "info", "انتقال امتیاز", "انتقال امتیاز به بستگان/کارکنان مجاز است؛ مراقب شکل‌گیری بازار خاکستری خرید و فروش امتیاز باشید.", "رویه نیک‌وام ملت و مهر ایران");
-    if (pt.coefficient > 3.5) add("pts_coef", "warn", "پایداری ضریب تبدیل", `ضریب ${fa(pt.coefficient)} بسیار سخاوتمندانه است؛ تراز پول–زمان منفی می‌شود.`, "قاعده پول–زمان");
+    if (!tiered && pt.coefficient > 3.5) add("pts_coef", "warn", "پایداری ضریب تبدیل", `ضریب ${fa(pt.coefficient)} بسیار سخاوتمندانه است؛ تراز پول–زمان منفی می‌شود.`, "قاعده پول–زمان");
   }
 
   if (isLoyalty || cfg.family === "hybrid") {
@@ -139,6 +156,10 @@ export function generateInsights(cfg: ProductConfig, sim: SimResult, comp: Compl
       out.push({ id: "price_up", level: "critical", title: "محصول زیان‌ده است", body: `نرخ سربه‌سر ${fa(pr.breakEven)}٪ و نرخ مبتنی بر ریسک ${fa(pr.riskBased)}٪ است در حالی که نرخ محصول ${fa(pr.productRate)}٪ است. زیان خالص: ${fa(kp.netProfit, 0)} میلیارد تومان.`, impact: "بازگشت به سودآوری", action: { label: `افزایش نرخ به ${fa(target)}٪`, patch: { credit: { rate: target } } } });
     } else if (isCredit && pr.breakEven > cap) {
       out.push({ id: "rationing", level: "critical", title: "شکاف ساختاری قیمت‌گذاری (سقف دستوری)", body: `حتی با سقف ${fa(cap, 0)}٪ محصول سربه‌سر نمی‌شود (نرخ سربه‌سر ${fa(pr.breakEven)}٪). این همان «جیره‌بندی اعتبار» استیگلیتز–وایس است: باید ریسک را کاهش داد، نه قیمت را افزایش.`, action: { label: "سخت‌گیری اعتباری + کانال دیجیتال", patch: { risk: { minScore: Math.min(720, cfg.risk.minScore + 40), altData: true }, channel: "digital", credit: { upfrontFee: Math.min(3, cr.upfrontFee + 1) } } } });
+    } else if (isPoints && cfg.points.mode === "tiered_murabaha" && cfg.points.tiers.length > 0) {
+      out.push({ id: "pts_loss", level: "critical", title: "طرح امتیازی زیان‌ده است", body: `ارزش منابع ارزان (${fa(kp.fundingBenefit, 0)} میلیارد) زیان پله‌های کم‌نرخ را پوشش نمی‌دهد. نرخ پله‌های بلندمدت یا ضریب α آن‌ها را بازبینی کنید (آزمایشگاه ALM ← طراح معکوس پله‌ها).`, action: { label: "نرخ پله‌ها +۲ واحد (حداکثر ۲۳٪)", patch: { points: { tiers: cfg.points.tiers.map((t) => ({ ...t, rate: Math.min(CBI.loanRateCap, t.rate + 2) })) } } } });
+    } else if (isPoints && cfg.contract !== "qard") {
+      out.push({ id: "pts_loss", level: "critical", title: "طرح امتیازی زیان‌ده است", body: `ارزش منابع ارزان (${fa(kp.fundingBenefit, 0)} میلیارد) هزینه وام‌ها را پوشش نمی‌دهد. ضریب تبدیل ${fa(cfg.points.coefficient)} را کاهش یا نرخ سود را افزایش دهید.`, action: { label: "ضریب −۱۵٪ و نرخ +۲", patch: { points: { coefficient: Math.max(1, Math.round(cfg.points.coefficient * 0.85 * 10) / 10) }, credit: { rate: Math.min(CBI.loanRateCap, cfg.credit.rate + 2) } } } });
     } else if (isPoints) {
       out.push({ id: "pts_loss", level: "critical", title: "طرح امتیازی زیان‌ده است", body: `ارزش منابع ارزان (${fa(kp.fundingBenefit, 0)} میلیارد) هزینه تأمین وام‌های کم‌کارمزد را پوشش نمی‌دهد. ضریب تبدیل ${fa(cfg.points.coefficient)} را کاهش یا کارمزد را تا ۴٪ افزایش دهید.`, action: { label: "ضریب −۱۵٪ و کارمزد ۴٪", patch: { points: { coefficient: Math.max(1, Math.round(cfg.points.coefficient * 0.85 * 10) / 10), loanFee: 4 } } } });
     } else if (isLoyalty) {
@@ -190,13 +211,20 @@ export function generateInsights(cfg: ProductConfig, sim: SimResult, comp: Compl
   }
 
   // points specific
+  const tieredPts = isPoints && cfg.points.mode === "tiered_murabaha" && cfg.points.tiers.length > 0;
+  if (isPoints && kp.raroc > 0 && kp.rarocCredit < 0) {
+    out.push({ id: "franchise", level: "warning", title: "ارزش طرح فقط از منابع ارزان است", body: `RAROC اعلامی ${fa(kp.raroc, 0)}٪ است، اما بدون ارزش منابع ارزان (FTP) به ${fa(kp.rarocCredit, 0)}٪ می‌رسد؛ با هزینه بافر نقدینگی و سرمایه ریسک نقدینگی ${fa(kp.rarocLiquidity, 0)}٪ می‌شود. سودآوری به ماندگاری سپرده و نرخ FTP وابسته است — سناریوی خروج سپرده را در آزمایشگاه ALM بسنجید.` });
+  }
   if (isPoints) {
-    if (kp.moneyTimeRatio > 0 && kp.moneyTimeRatio < 1) {
+    // coefficient / minimum-holding knobs do not exist in a tiered menu → only advise them in simple mode
+    if (tieredPts) {
+      /* tier economics are reviewed in the ALM lab */
+    } else if (kp.moneyTimeRatio > 0 && kp.moneyTimeRatio < 1) {
       out.push({ id: "src_use", level: "critical", title: "مصارف بیش از منابع", body: `تراز پول–زمان (سپرده‌ماه به وام‌ماه در کل عمر) ${fa(kp.moneyTimeRatio, 2)} است؛ بانک بیش از پول–زمان دریافتی وام می‌دهد.`, action: { label: "ضریب تبدیل −۱۵٪", patch: { points: { coefficient: Math.max(1, Math.round(cfg.points.coefficient * 0.85 * 10) / 10) } } } });
     } else if (kp.moneyTimeRatio > 2.2 && kp.netProfit > 0) {
       out.push({ id: "src_surplus", level: "opportunity", title: "مازاد منابع: فرصت سخاوت بیشتر", body: `تراز پول–زمان ${fa(kp.moneyTimeRatio, 1)} است (منابع بیش از دو برابر مصارف). افزایش ضریب تبدیل جذابیت و جذب سپرده را بالا می‌برد.`, action: { label: "ضریب تبدیل +۱۵٪", patch: { points: { coefficient: Math.round(cfg.points.coefficient * 1.15 * 10) / 10 } } } });
     }
-    if (kp.avgWaitDays > 200) {
+    if (!tieredPts && kp.avgWaitDays > 200) {
       out.push({ id: "wait", level: "warning", title: "انتظار طولانی برای امتیاز", body: `متوسط زمان انباشت امتیاز ${fa(kp.avgWaitDays, 0)} روز است و مشتریان کم‌حوصله ریزش می‌کنند.`, action: { label: "حداقل نگهداری ۳۰ روز", patch: { points: { minHoldingDays: 30 } } } });
     }
     if (!cfg.points.transferable) {

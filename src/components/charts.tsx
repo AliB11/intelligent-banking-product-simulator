@@ -316,3 +316,110 @@ export function Funnel({ stages }: { stages: { stage: string; value: number }[] 
     </div>
   );
 }
+
+export interface OptionPoint {
+  id: string;
+  x: number;
+  y: number;
+  front: boolean;
+  selected?: boolean;
+}
+
+/** Clickable scatter of a menu of customer options (x = customer utility, y = bank yield); Pareto front highlighted. */
+export function OptionsScatter({
+  points,
+  xLabel,
+  yLabel,
+  onSelect,
+  height = 320,
+}: {
+  points: OptionPoint[];
+  xLabel: string;
+  yLabel: string;
+  onSelect?: (id: string) => void;
+  height?: number;
+}) {
+  const other = points.filter((p) => !p.front && !p.selected);
+  const front = points.filter((p) => p.front && !p.selected).sort((a, b) => a.x - b.x);
+  const selected = points.filter((p) => p.selected);
+  const click = (d: unknown) => {
+    const id = (d as { payload?: { id?: string }; id?: string } | null)?.payload?.id ?? (d as { id?: string } | null)?.id;
+    if (id && onSelect) onSelect(id);
+  };
+  return (
+    <div className="ltr" style={{ width: "100%", height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <ScatterChart margin={{ top: 10, right: 12, bottom: 24, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+          <XAxis type="number" dataKey="x" name={xLabel} domain={["auto", "auto"]} tick={{ fontSize: 11 }} tickFormatter={(v) => fmt(Number(v))} label={{ value: xLabel, position: "insideBottom", offset: -12, fontSize: 11 }} />
+          <YAxis type="number" dataKey="y" name={yLabel} domain={["auto", "auto"]} tick={{ fontSize: 11 }} tickFormatter={(v) => `${fmt(Number(v))}٪`} width={52} />
+          <ZAxis range={[40, 40]} />
+          <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => [fmt(Number(v), 1), name]} cursor={{ strokeDasharray: "3 3" }} />
+          <Scatter name="گزینه‌های مغلوب" data={other} fill="#cbd5e1" onClick={click} style={{ cursor: "pointer" }} />
+          <Scatter name="مرز پارتو" data={front} fill="#10b981" line={{ stroke: "#10b981", strokeWidth: 2 }} onClick={click} style={{ cursor: "pointer" }} />
+          {selected.length > 0 && <Scatter name="انتخاب‌شده" data={selected} fill="#e11d48" shape="star" />}
+          <Legend verticalAlign="top" wrapperStyle={{ fontSize: 12 }} />
+        </ScatterChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+/** Heat-map grid (rows × columns) with a value-driven colour scale (green = low risk, red = high). */
+export function HeatGrid({
+  rows,
+  cols,
+  value,
+  label,
+  sub,
+  rowTitle,
+  colTitle,
+}: {
+  rows: number[];
+  cols: number[];
+  value: (r: number, c: number) => number;
+  label: (r: number, c: number) => string;
+  sub?: (r: number, c: number) => string;
+  rowTitle: string;
+  colTitle: string;
+}) {
+  const vals = rows.flatMap((r) => cols.map((c) => value(r, c)));
+  const max = Math.max(1e-9, ...vals);
+  const color = (v: number) => {
+    const t = Math.min(1, Math.max(0, v / max));
+    // emerald-100 → amber-300 → rose-500
+    const stops: [number, number, number][] = [[209, 250, 229], [252, 211, 77], [244, 63, 94]];
+    const seg = t < 0.5 ? 0 : 1;
+    const k = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
+    const a = stops[seg], b = stops[seg + 1];
+    return `rgb(${a.map((x, i) => Math.round(x + (b[i] - x) * k)).join(",")})`;
+  };
+  const sign = (n: number) => (n > 0 ? `+${fmt(n)}` : fmt(n));
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full border-separate border-spacing-1 text-xs">
+        <thead>
+          <tr>
+            <th className="p-1 text-[10px] font-normal text-slate-400">{rowTitle} ↓ / {colTitle} ←</th>
+            {cols.map((c) => (
+              <th key={c} className="p-1 font-medium text-slate-600">{sign(c)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r}>
+              <th className="p-1 font-medium text-slate-600">{sign(r)}</th>
+              {cols.map((c) => (
+                <td key={c} className="rounded-lg p-2 text-center tabular-nums" style={{ background: color(value(r, c)) }}>
+                  <div className={`font-bold ${r === 0 && c === 0 ? "underline" : ""}`}>{label(r, c)}</div>
+                  {sub && <div className="text-[10px] text-slate-700">{sub(r, c)}</div>}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
