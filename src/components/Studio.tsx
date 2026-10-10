@@ -4,10 +4,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { ComboChart, DnaRadar } from "@/components/charts";
+import TierTable from "@/components/TierTable";
 import { Badge, Btn, Card, COMP_LEVEL, Gauge, LEVEL, Num, Select, Spinner, Stat, Tabs, TextField, Toggle } from "@/components/ui";
 import { analyzeResult } from "@/lib/engine/advisor";
 import { CBI, CHANNELS, COLLATERALS, CONTRACTS, FAMILIES, KINDS, PURPOSES, REPAYMENTS, SEGMENTS, rewardRate, scoreGrade } from "@/lib/engine/catalog";
-import { pointsLoanLimit } from "@/lib/engine/math";
+import { isTieredPoints, pointsLoanLimit } from "@/lib/engine/math";
 import { QUICK_PARAMS, repaymentPreview, simulatePortfolio } from "@/lib/engine/simulator";
 import { changeContractConfig, changeFamilyConfig, changeKindConfig, type StructuralChange } from "@/lib/engine/profile";
 import { mergeConfig, suggestName } from "@/lib/engine/templates";
@@ -63,6 +64,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
   const isRev = cfg.kind === "credit_card" || cfg.kind === "credit_line";
   const hasLoyalty = isLoyalty || cfg.family === "hybrid";
   const cap = cfg.contract === "qard" ? CBI.qardFeeCap : CBI.loanRateCap;
+  const tiered = isTieredPoints(cfg);
 
   const tabs = useMemo(() => {
     const t: { key: TabKey; label: string; icon: string }[] = [{ key: "identity", label: "هویت و بازار", icon: "🪪" }];
@@ -192,7 +194,12 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
         {activeTab === "pricing" && (
           <Card title="قیمت‌گذاری و کارمزدها" icon="💰" subtitle="نرخ مؤثر (APR) شامل کارمزدها، بیمه و سپرده جبرانی محاسبه می‌شود.">
             <div className="grid gap-4 sm:grid-cols-2">
-              {isPoints ? (
+              {tiered ? (
+                <div className="rounded-xl border border-indigo-100 bg-indigo-50/60 p-3 text-xs leading-6 text-indigo-900">
+                  نرخ سود هر پله در جدول «موتور امتیاز» تعیین می‌شود (سقف هر پله: ۲۳٪).
+                  <button type="button" className="mr-2 font-bold underline" onClick={() => setTab("points")}>ویرایش پله‌ها</button>
+                </div>
+              ) : isPoints && cfg.contract === "qard" ? (
                 <Num label="کارمزد وام امتیازی" value={cfg.points.loanFee} onChange={(v) => setS("points", "loanFee", v)} min={0} max={8} step={0.5} unit="٪" warn={cfg.points.loanFee > 4} hint="سقف کارمزد قرض‌الحسنه: ۴٪" />
               ) : (
                 <Num
@@ -263,17 +270,27 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
         )}
 
         {activeTab === "points" && (
-          <Card title="موتور امتیاز پول–زمان" icon="⭐" subtitle="L = k × B × H / N — وام قابل دریافت بر اساس میانگین موجودی (B)، ماه‌های نگهداری (H) و دوره بازپرداخت (N)">
+          <Card
+            title={tiered ? "منوی پله‌ای «صبر بیشتر، شرایط بهتر»" : "موتور امتیاز پول–زمان"}
+            icon="⭐"
+            subtitle={tiered ? "وام = α × میانگین موجودی پس از دوره انتظار هر پله؛ نرخ و دوره بازپرداخت از همان پله" : "L = k × B × H / N — وام قابل دریافت بر اساس میانگین موجودی (B)، ماه‌های نگهداری (H) و دوره بازپرداخت (N)"}
+          >
+            {tiered && (
+              <div className="mb-4">
+                <TierTable tiers={cfg.points.tiers} upfrontFee={cfg.credit.upfrontFee} insurance={cfg.credit.insurance} onChange={(t) => setS("points", "tiers", t)} />
+              </div>
+            )}
             <div className="grid gap-4 sm:grid-cols-2">
-              <Num label="ضریب تبدیل امتیاز (k)" value={cfg.points.coefficient} onChange={(v) => setS("points", "coefficient", v)} min={0.5} max={5} step={0.1} hint="رسالت ≈ ۲ | نیک‌وام ملت ≈ ۳.۲" warn={cfg.points.coefficient > 3.5} />
-              <Num label="حداقل دوره معدل‌گیری" value={cfg.points.minHoldingDays} onChange={(v) => setS("points", "minHoldingDays", v)} min={0} max={365} step={5} unit="روز" />
+              {tiered && <Num label="سقف وام هر مشتری" value={cfg.points.individualLoanCap} onChange={(v) => setS("points", "individualLoanCap", v)} min={1} max={2000} step={10} unit="م.ت" />}
+              {!tiered && <Num label="ضریب تبدیل امتیاز (k)" value={cfg.points.coefficient} onChange={(v) => setS("points", "coefficient", v)} min={0.5} max={5} step={0.1} hint="رسالت ≈ ۲ | نیک‌وام ملت ≈ ۳.۲" warn={cfg.points.coefficient > 3.5} />}
+              {!tiered && <Num label="حداقل دوره معدل‌گیری" value={cfg.points.minHoldingDays} onChange={(v) => setS("points", "minHoldingDays", v)} min={0} max={365} step={5} unit="روز" />}
               <Num label="سقف وام امتیازی" value={cfg.points.maxLoan} onChange={(v) => setS("points", "maxLoan", v)} min={10} max={2000} step={10} unit="م.ت" />
               <Num label="نرخ استفاده از امتیاز (رفتاری)" value={cfg.points.usageRate} onChange={(v) => setS("points", "usageRate", v)} min={5} max={100} step={1} unit="٪" hint="بقیه امتیازها سوخت یا ذخیره می‌شوند" />
-              <Num label="جایزه/سود حساب امتیازی" value={cfg.points.depositRate} onChange={(v) => setS("points", "depositRate", v)} min={0} max={10} step={0.5} unit="٪" warn={cfg.points.depositRate > 0} />
+              <Num label="جایزه/سود حساب امتیازی" value={cfg.points.depositRate} onChange={(v) => setS("points", "depositRate", v)} min={0} max={10} step={0.01} unit="٪" warn={cfg.contract === "qard" && cfg.points.depositRate > 0} hint={cfg.contract === "qard" ? "حساب قرض‌الحسنه سود قطعی ندارد" : undefined} />
               <Num label="انقضای امتیاز (۰ = ندارد)" value={cfg.points.expiryMonths} onChange={(v) => setS("points", "expiryMonths", v)} min={0} max={60} step={1} unit="ماه" />
               <Toggle label="قابلیت انتقال امتیاز" checked={cfg.points.transferable} onChange={(v) => setS("points", "transferable", v)} hint="انتقال به بستگان درجه یک یا کارکنان" />
             </div>
-            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/60 p-3">
+            {!tiered && <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/60 p-3">
               <div className="mb-2 text-sm font-bold text-amber-800">🧮 ماشین‌حساب امتیاز</div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <Num label="میانگین موجودی" value={calcBalance} onChange={setCalcBalance} min={1} max={2000} step={1} unit="م.ت" />
@@ -284,7 +301,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
                 <Stat label="ارزش هر ۱ م.ت در روز" value={`${fmt((cfg.points.coefficient / 360) * 1e6)} تومان`} sub="امتیاز وام ۱۲ ماهه" />
                 <Stat label="معادل وام ۱۲ ماهه" value={mt(pointsLoanLimit(calcBalance, calcDays / 30, 12, cfg.points.coefficient))} />
               </div>
-            </div>
+            </div>}
           </Card>
         )}
 

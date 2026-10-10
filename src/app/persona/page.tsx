@@ -47,7 +47,7 @@ export default function PersonaPage() {
     const c = personaToCustomer(persona);
     const ctx = marketContext(cfg, 26, "base");
     const uw = underwrite(cfg, c, ctx, cfg.kind === "loyalty" ? undefined : persona.need);
-    const sched = cfg.kind !== "loyalty" && cfg.kind !== "credit_card" && cfg.kind !== "credit_line" && uw.amount > 0 ? repaymentPreview(cfg, uw.amount) : null;
+    const sched = cfg.kind !== "loyalty" && cfg.kind !== "credit_card" && cfg.kind !== "credit_line" && uw.amount > 0 ? repaymentPreview(cfg, uw.amount, uw.tierIndex) : null;
     return { c, uw, sched, apr: aprFor(cfg), bureau: observedScore(c, false), alt: observedScore(c, true) };
   }, [cfg, persona]);
 
@@ -66,7 +66,13 @@ export default function PersonaPage() {
     const days = Math.max(30, Math.round(uw.holdMonths * 30) + 60);
     const pts: { m: number; loan: number; need: number }[] = [];
     for (let d = 0; d <= days; d += Math.max(1, Math.round(days / 40))) {
-      pts.push({ m: d, loan: Math.min(cfg.points.maxLoan, pointsLoanLimit(uw.deposit, d / 30, cfg.credit.tenor, cfg.points.coefficient)), need: Math.min(persona.need, cfg.points.maxLoan) });
+      const tier = uw.tierIndex >= 0 ? cfg.points.tiers[uw.tierIndex] : undefined;
+      // tiered menu: the loan unlocks as a step (α × average balance) when the chosen tier's wait ends
+      const limit = tier
+        ? d / 30 >= tier.waitingMonths && uw.deposit >= tier.minAvgDeposit ? (tier.loanToAvgDepositPct / 100) * uw.deposit : 0
+        : pointsLoanLimit(uw.deposit, d / 30, cfg.credit.tenor, cfg.points.coefficient);
+      const capAmt = Math.min(cfg.points.maxLoan, tier ? cfg.points.individualLoanCap : Infinity);
+      pts.push({ m: d, loan: Math.min(capAmt, limit), need: Math.min(persona.need, capAmt) });
     }
     return pts;
   }, [cfg, uw, isPoints, persona.need]);

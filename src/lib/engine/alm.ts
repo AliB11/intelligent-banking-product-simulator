@@ -1,7 +1,19 @@
 // =========================================================================
 //  موتور شبیه‌سازی ALM (دارایی-بدهی) برای محصولات امتیازی چندپله‌ای
 //  پورت و بسط‌یافته از مخزن alm-simulation-engine-development برای سیمرغ
+//
+//  قراردادهای مدل (بازبینی ۱۴۰۵/۰۷/۱۹):
+//  • همه مبالغ داخلی «میلیارد تومان»؛ نرخ‌ها «درصد سالانه»؛ زمان «ماه» (t = 0 … H).
+//  • سپرده هر پله در ماه ۰ وارد می‌شود و سپرده قانونی همان لحظه نگه داشته می‌شود.
+//  • در پایان انتظار (t = T_dep) وام اعطا و بخشی از سپرده برداشت می‌شود؛ سپرده قانونی
+//    به نسبت برداشت آزاد می‌شود. نخستین قسط در ماه T_dep + 1 دریافت می‌شود.
+//  • نکول به‌صورت انتظار ریاضی (PD × LGD) از جریان نقد وصولی کسر و هم‌زمان ذخیره
+//    مطالبات در سود و زیان شناسایی می‌شود.
+//  • هزینه بین‌بانکی روی کسری انباشته ماه قبل محاسبه و در همان ماه از NCF کسر می‌شود؛
+//    بنابراین همیشه cum_t = Σ ncf.
 // =========================================================================
+import { COLLATERALS } from "./catalog";
+import { clamp, irr, mulberry32, normal, quantile, sum } from "./math";
 import type {
   AlmFlowEvent,
   AlmKpis,
@@ -11,43 +23,18 @@ import type {
   FullAlmResult,
   GameTierResult,
   Kpis,
+  LiquidityStressCell,
   NeginCustomerOption,
   PrepaymentModel,
   ProductConfig,
-  SimParams,
   TieredMurabahaTier,
+  TornadoItem,
 } from "./types";
 
-// --------------- ابزارهای ریاضی پایه ---------------
+/** سقف عددی برای نسبت‌هایی که مخرجشان صفر می‌شود (JSON مقدار Infinity را پشتیبانی نمی‌کند). */
+export const RATIO_CAP = 999;
 
-export function uid(): string {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-function clamp(x: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, x));
-}
-
-function sum(arr: number[]): number {
-  return arr.reduce((a, b) => a + b, 0);
-}
-
-function mulberry32(seed: number) {
-  let t = seed >>> 0;
-  return function () {
-    t = (t + 0x6d2b79f5) >>> 0;
-    let r = Math.imul(t ^ (t >>> 15), 1 | t);
-    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function normal(rand: () => number): number {
-  // بوکس-مولر
-  const u = Math.max(1e-9, rand());
-  const v = rand();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-}
+// --------------- فرمول‌های اقساط ---------------
 
 /** قسط ماهانه قرض‌الحسنه با کارمزد ساده سالانه */
 export function pmtQard(principal: number, feePct: number, months: number): number {
@@ -58,12 +45,94 @@ export function pmtQard(principal: number, feePct: number, months: number): numb
 /** قسط ماهانه مرابحه (اقساط مساوی = فرمول استاندارد وام) */
 export function pmtMurabaha(principal: number, annualRatePct: number, months: number): number {
   if (annualRatePct <= 0 || months <= 0) return months > 0 ? principal / months : principal;
-  const rm = annualRatePct / 100 / 12;
-  return (principal * rm * Math.pow(1 + rm, months)) / (Math.pow(1 + rm, months) - 1);
+  const rm = annualRatePct / 1200;
+  const f = Math.pow(1 + rm, months);
+  return (principal * rm * f) / (f - 1);
 }
 
 export function pmtFor(contract: "qard" | "murabaha", principal: number, rate: number, months: number): number {
   return contract === "qard" ? pmtQard(principal, rate, months) : pmtMurabaha(principal, rate, months);
+}
+
+/** جدول تفکیک قسط به اصل و سود (یا کارمزد) برای اصل واحد/دلخواه. */
+export function splitSchedule(contract: "qard" | "murabaha", principal: number, rate: number, months: number) {
+  const n = Math.max(1, Math.round(months));
+  const pmt = pmtFor(contract, principal, rate, n);
+  const prin: number[] = [];
+  const inc: number[] = [];
+  const bal: number[] = [];
+  let b = principal;
+  for (let k = 0; k < n; k++) {
+    let interest: number;
+    let p: number;
+    if (contract === "qard") {
+      interest = (principal * (rate / 100) * (n / 12)) / n;
+      p = principal / n;
+    } else {
+      interest = b * (rate / 1200);
+      p = k === n - 1 ? b : pmt - interest;
+    }
+    b = Math.max(0, b - p);
+    prin.push(p);
+    inc.push(interest);
+    bal.push(b);
+  }
+  return { pmt, prin, inc, bal, n };
+}
+
+/** نرخ مؤثر سالانه (درصد) از نرخ ماهانه IRR. */
+const annualize = (monthly: number) => (Math.pow(1 + monthly, 12) - 1) * 100;
+
+/**
+ * هزینه تمام‌شده مشتری (all-in) شامل هزینه فرصت سپرده‌گذاری.
+ * ارزش آتی هزینه فرصت تا ماه اعطا از مبلغ وام کسر می‌شود و IRR جریان
+ * [L − OC, −PMT × n] سالانه می‌شود. اگر هزینه فرصت از کل وام بیشتر باشد، RATIO_CAP برمی‌گردد.
+ */
+export function customerAllInCost(
+  loan: number,
+  deposit: number,
+  waitMonths: number,
+  pmt: number,
+  months: number,
+  opportunityRatePct: number,
+  depositRatePct: number,
+): { cost: number; opportunityCost: number } {
+  const oc = deposit * (Math.pow(1 + opportunityRatePct / 1200, waitMonths) - Math.pow(1 + depositRatePct / 1200, waitMonths));
+  const net = loan - oc;
+  if (loan <= 0 || pmt <= 0) return { cost: 0, opportunityCost: oc };
+  if (net <= 0) return { cost: RATIO_CAP, opportunityCost: oc };
+  const cfs = [net, ...Array.from({ length: months }, () => -pmt)];
+  const r = irr(cfs);
+  return { cost: Math.min(RATIO_CAP, annualize(r)), opportunityCost: oc };
+}
+
+/**
+ * بازده مؤثر بانک روی وام با احتساب ارزش منابع ارزان دوره انتظار:
+ * سپرده (پس از سپرده قانونی) با نرخ FTP به کار گرفته می‌شود و سود سپرده پرداخت می‌شود.
+ */
+export function bankEffectiveYield(
+  loan: number,
+  deposit: number,
+  waitMonths: number,
+  pmt: number,
+  months: number,
+  costOfFundsPct: number,
+  depositRatePct: number,
+  reserveRatioPct: number,
+): number {
+  if (loan <= 0 || pmt <= 0) return 0;
+  const benefit =
+    deposit * (1 - reserveRatioPct / 100) * (Math.pow(1 + costOfFundsPct / 1200, waitMonths) - 1) -
+    deposit * (Math.pow(1 + depositRatePct / 1200, waitMonths) - 1);
+  const net = loan - benefit;
+  if (net <= 0) return RATIO_CAP;
+  const r = irr([-net, ...Array.from({ length: months }, () => pmt)]);
+  return Math.min(RATIO_CAP, annualize(r));
+}
+
+/** PD سالانه مدل ALM از حد نصاب امتیاز (منحنی نمایی هموار به‌جای پله‌ای). */
+export function almPd(minScore: number): number {
+  return clamp(0.2 * Math.exp(-(minScore - 400) / 120), 0.01, 0.2);
 }
 
 // --------------- تخصیص مشتری به گزینه‌های منو (۲۵۰ ترکیب) ---------------
@@ -92,8 +161,19 @@ export function enumerateWaitAllocations(maxExtraMonths: number = 10, cfg: Produ
   return out;
 }
 
+/** پله پایه (کوتاه‌ترین انتظار) — مبدأ منوی سه‌گانه. */
+function baseTier(cfg: ProductConfig): { alpha: number; tenor: number; rate: number; minWait: number } {
+  const pts = cfg.points;
+  const minWait = Math.max(1, Math.ceil(pts.minHoldingDays / 30));
+  const sorted = [...(pts.tiers ?? [])].sort((a, b) => a.waitingMonths - b.waitingMonths);
+  const t0 = sorted[0];
+  return t0
+    ? { alpha: t0.loanToAvgDepositPct, tenor: t0.repaymentMonths, rate: t0.rate, minWait: Math.max(minWait, t0.waitingMonths) }
+    : { alpha: 25, tenor: 16, rate: 23, minWait };
+}
+
 /**
- * تولید تمام ~۲۵۰ گزینه انتخابی مشتری برای یک میانگین سپرده معین
+ * تولید تمام ~۲۵۰ گزینه انتخابی مشتری برای یک میانگین سپرده معین (میلیون تومان)
  */
 export function generateNeginOptions(
   avgBalanceMillionToman: number,
@@ -101,67 +181,63 @@ export function generateNeginOptions(
   opportunityRatePct: number = 23,
 ): NeginCustomerOption[] {
   const pts = cfg.points;
-  const minWait = Math.ceil(pts.minHoldingDays / 30);
+  const base = baseTier(cfg);
   const maxWait = 12;
+  const alphaMax = base.alpha + pts.maxAmountBoostMonths * pts.alphaStepPerWaitMonth;
+  const tenorMax = base.tenor + pts.maxTenorBoostMonths * pts.tenorStepPerWaitMonth;
+  const rateMin = Math.max(0, base.rate - pts.maxRateCutMonths * pts.rateCutPerWaitMonth);
+  const isQard = cfg.contract === "qard";
+  const pd = almPd(cfg.risk.minScore);
+  const lgd = (COLLATERALS[cfg.risk.collateral] ?? COLLATERALS.scoring).lgd;
   const out: NeginCustomerOption[] = [];
   let idx = 0;
-    for (let wait = minWait; wait <= maxWait; wait++) {
-    const extra = wait - minWait;
-    const allocs = enumerateWaitAllocations(extra, cfg);
-    for (const alloc of allocs) {
-      const alphaPct = clamp(25 + alloc.amountBoostMonths * pts.alphaStepPerWaitMonth, 25, 200);
-      const tenor = clamp(16 + alloc.tenorBoostMonths * pts.tenorStepPerWaitMonth, 16, 60);
-      const rate = clamp(23 - alloc.rateCutMonths * pts.rateCutPerWaitMonth, 5, 23);
-      let loan = (alphaPct / 100) * avgBalanceMillionToman;
-      loan = Math.min(loan, pts.individualLoanCap);
-      const alphaVal = alphaPct;
-      const installment = pmtMurabaha(loan, rate, tenor);
+  for (let wait = base.minWait; wait <= maxWait; wait++) {
+    const extra = wait - base.minWait;
+    for (const alloc of enumerateWaitAllocations(extra, cfg)) {
+      const alphaPct = clamp(base.alpha + alloc.amountBoostMonths * pts.alphaStepPerWaitMonth, 0, alphaMax);
+      const tenor = Math.round(clamp(base.tenor + alloc.tenorBoostMonths * pts.tenorStepPerWaitMonth, 1, tenorMax));
+      const rate = clamp(base.rate - alloc.rateCutMonths * pts.rateCutPerWaitMonth, rateMin, base.rate);
+      const loan = Math.min((alphaPct / 100) * avgBalanceMillionToman, pts.individualLoanCap);
+      const installment = pmtFor(isQard ? "qard" : "murabaha", loan, rate, tenor);
       const totalRepay = installment * tenor;
-      const interest = totalRepay - loan;
-      // هزینه فرصت سپرده‌گذاری (با نرخ فرصت بازار منهای سود پرداختی بانک)
-      const oppCost = avgBalanceMillionToman * ((opportunityRatePct - pts.depositRate) / 100) * (wait / 12);
-      const depositProfit = avgBalanceMillionToman * (pts.depositRate / 100) * (wait / 12);
-      const effectiveCost = totalRepay + oppCost - depositProfit;
-      // محاسبه بازده مؤثر سالانه بانک (با تقریب ساده)
-      const annFactor = rate > 0 ? (Math.pow(1 + rate / 1200, tenor) - 1) / (rate / 1200 * Math.pow(1 + rate / 1200, tenor)) : tenor;
-      const bankAnnualYield = annFactor > 0 ? (installment * 12) / (loan * annFactor) * (tenor / 12) * 100 : 0;
+      const allIn = customerAllInCost(loan, avgBalanceMillionToman, wait, installment, tenor, opportunityRatePct, pts.depositRate);
+      // بازده بانک پس از زیان مورد انتظار (اقساط × (۱ − PD×LGD))
+      const bankYield = bankEffectiveYield(
+        loan, avgBalanceMillionToman, wait, installment * (1 - pd * lgd), tenor,
+        cfg.funding.costOfFunds, pts.depositRate, cfg.funding.reserveRatio,
+      );
       // مطلوبیت مشتری (۰ تا ۱۰۰): وام بیشتر، اقساط بلندتر، نرخ کمتر، انتظار کوتاه‌تر
-      const loanScore = clamp(loan / Math.max(1, pts.individualLoanCap) * 100, 0, 100);
-      const rateScore = clamp((23 - rate) / 18 * 100, 0, 100);
-      const tenorScore = clamp((tenor - 16) / 44 * 100, 0, 100);
-      const waitPenalty = wait / 12 * 50;
+      const loanScore = clamp((loan / Math.max(1, pts.individualLoanCap)) * 100, 0, 100);
+      const rateScore = base.rate > rateMin ? clamp(((base.rate - rate) / (base.rate - rateMin)) * 100, 0, 100) : 0;
+      const tenorScore = tenorMax > base.tenor ? clamp(((tenor - base.tenor) / (tenorMax - base.tenor)) * 100, 0, 100) : 0;
+      const waitPenalty = (wait / 12) * 50;
       const customerUtility = clamp(loanScore * 0.3 + rateScore * 0.4 + tenorScore * 0.3 - waitPenalty + 50, 0, 100);
       out.push({
         comboId: `c${idx++}`,
         loanAmount: Math.round(loan * 100) / 100,
         tenor,
         rate,
-        alpha: alphaVal,
+        alpha: alphaPct,
         waitingMonths: wait,
         monthlyInstallment: Math.round(installment * 1000) / 1000,
         totalRepayment: Math.round(totalRepay * 100) / 100,
-        opportunityCost: Math.round(oppCost * 100) / 100,
-        effectiveCustomerCost: Math.round(effectiveCost * 100) / 100,
-        bankEffectiveYield: Math.max(0, rate - 2), // ساده‌سازی
+        opportunityCost: Math.round(allIn.opportunityCost * 100) / 100,
+        effectiveCustomerCost: Math.round((totalRepay + allIn.opportunityCost) * 100) / 100,
+        bankEffectiveYield: Math.round(bankYield * 100) / 100,
         customerUtility,
         paretoOptimal: false,
       });
     }
   }
-  // محاسبه نقاط پارتو (غیرمغلوب)
-  // نقاطی بهترند که هم مطلوبیت مشتری بالاتر و هم بازده بانک بیشتر باشد
+  // نقاط پارتو (غیرمغلوب): مطلوبیت مشتری بالاتر و بازده بانک بیشتر
   for (let i = 0; i < out.length; i++) {
     let dominated = false;
-    for (let j = 0; j < out.length; j++) {
+    for (let j = 0; j < out.length && !dominated; j++) {
       if (i === j) continue;
-      if (
+      dominated =
         out[j].customerUtility >= out[i].customerUtility &&
         out[j].bankEffectiveYield >= out[i].bankEffectiveYield &&
-        (out[j].customerUtility > out[i].customerUtility || out[j].bankEffectiveYield > out[i].bankEffectiveYield)
-      ) {
-        dominated = true;
-        break;
-      }
+        (out[j].customerUtility > out[i].customerUtility || out[j].bankEffectiveYield > out[i].bankEffectiveYield);
     }
     out[i].paretoOptimal = !dominated;
   }
@@ -173,361 +249,337 @@ export function generateNeginOptions(
 export interface AlmSimInput {
   cfg: ProductConfig;
   totalDepositBillionToman: number; // کل سپرده جذب شده (میلیارد تومان)
-  avgTicketMillionToman: number;   // میانگین سپرده هر مشتری
+  avgTicketMillionToman: number; // میانگین سپرده هر مشتری
   horizonMonths: number;
   takeUpRatePct: number;
   approvalRatePct: number;
-  runoffRatePct: number;     // نرخ خروج سپرده وام‌گیرندگان
-  churnRatePct: number;      // نرخ خروج سپرده انصرافی‌ها
+  runoffRatePct: number; // نرخ خروج سپرده وام‌گیرندگان در زمان اعطا
+  churnRatePct: number; // نرخ خروج سپرده سایر سپرده‌گذاران در پایان انتظار
   interbankRatePct: number;
   opportunityRatePct: number;
   reserveRatioPct: number;
   seed?: number;
+  /** بازده سرمایه‌گذاری مازاد نقد (٪ سالانه)؛ پیش‌فرض = نرخ انتقال وجوه (FTP) محصول، متقارن با هزینه کسری. */
+  surplusRatePct?: number;
+  /** تولید منوی ~۲۵۰ گزینه مشتری (در تحلیل‌های تکراری خاموش می‌شود). */
+  withOptions?: boolean;
+}
+
+/** پله‌های مؤثر محصول؛ در حالت ساده یک پله معادل ساخته می‌شود. */
+export function effectiveTiers(cfg: ProductConfig): TieredMurabahaTier[] {
+  const pts = cfg.points;
+  if (pts.mode === "tiered_murabaha" && pts.tiers && pts.tiers.length > 0) {
+    return pts.tiers.map((t, i) => ({ ...t, id: t.id ?? `t${i}` }));
+  }
+  return [{
+    name: "تک‌حالت",
+    waitingMonths: Math.max(1, Math.ceil(pts.minHoldingDays / 30)),
+    repaymentMonths: Math.max(1, Math.round(cfg.credit.tenor)),
+    loanToAvgDepositPct: clamp(pts.coefficient * 100, 25, 400),
+    rate: cfg.contract === "qard" ? pts.loanFee : cfg.credit.rate,
+    minAvgDeposit: 0,
+    expectedTakeUpShare: 100,
+    id: "t0",
+  }];
 }
 
 export function simulateAlm(inp: AlmSimInput): AlmResult {
   const t0 = Date.now();
-  const {
-    cfg,
-    totalDepositBillionToman,
-    avgTicketMillionToman,
-    horizonMonths,
-    takeUpRatePct,
-    approvalRatePct,
-    runoffRatePct,
-    churnRatePct,
-    interbankRatePct,
-    opportunityRatePct,
-    reserveRatioPct,
-  } = inp;
-  const totalDeposit = totalDepositBillionToman; // به میلیارد
-  const avgTicket = avgTicketMillionToman / 1000; // به میلیارد
+  const { cfg, avgTicketMillionToman, opportunityRatePct } = inp;
   const pts = cfg.points;
-  const isQard = cfg.contract === "qard";
+  const contract: "qard" | "murabaha" = cfg.contract === "qard" ? "qard" : "murabaha";
+  const totalDeposit = Math.max(0, inp.totalDepositBillionToman);
+  const avgTicket = Math.max(1e-6, avgTicketMillionToman / 1000); // میلیارد
   const nCustomers = Math.round(totalDeposit / avgTicket);
+  const H = Math.max(1, Math.round(inp.horizonMonths));
+  const rr = clamp(inp.reserveRatioPct, 0, 100) / 100;
+  const takeUp = clamp(inp.takeUpRatePct, 0, 100) / 100;
+  const approval = clamp(inp.approvalRatePct, 0, 100) / 100;
+  const runoff = clamp(inp.runoffRatePct, 0, 100) / 100;
+  const churn = clamp(inp.churnRatePct, 0, 100) / 100;
+  const borrowerShare = takeUp * approval;
+  const pd = almPd(cfg.risk.minScore);
+  const lgd = (COLLATERALS[cfg.risk.collateral] ?? COLLATERALS.scoring).lgd;
+  const el = pd * lgd;
 
-  // نرمال‌سازی سهم تخصیص پله‌ها
-  let tiers: TieredMurabahaTier[] = [];
-  if (pts.mode === "tiered_murabaha" && pts.tiers && pts.tiers.length > 0) {
-    tiers = pts.tiers.map((t, i) => ({ ...t, id: t.id ?? `t${i}` }));
-  } else {
-    // اگر پله تعریف نشده، یک پله تکی ساده بساز
-    tiers = [{
-      name: "تک‌حالت",
-      waitingMonths: Math.max(1, Math.ceil(pts.minHoldingDays / 30)),
-      repaymentMonths: cfg.credit.tenor,
-      loanToAvgDepositPct: clamp(pts.coefficient * 100, 25, 200),
-      rate: isQard ? pts.loanFee : cfg.credit.rate,
-      minAvgDeposit: 0,
-      expectedTakeUpShare: 100,
-      id: "t0",
-    }];
-  }
-  const totalShare = Math.max(1, sum(tiers.map((t) => t.expectedTakeUpShare)));
+  const tiers = effectiveTiers(cfg);
+  const rawShare = sum(tiers.map((t) => Math.max(0, t.expectedTakeUpShare)));
+  const shareOf = (t: TieredMurabahaTier) => (rawShare > 0 ? Math.max(0, t.expectedTakeUpShare) / rawShare : 1 / tiers.length);
 
-  // آماده‌سازی آرایه ماه‌ها
-  const H = Math.max(1, horizonMonths);
   const rows: AlmMonthRow[] = [];
   for (let t = 0; t <= H; t++) {
     rows.push({
       t, depositGross: 0, reserveHeld: 0, reserveRelease: 0, depositNet: 0,
       pmtInflow: 0, principalIn: 0, incomeIn: 0, inflow: 0,
-      loanOut: 0, withdrawalOut: 0, profitPaid: 0, fundingCost: 0,
+      loanOut: 0, withdrawalOut: 0, profitPaid: 0, fundingCost: 0, surplusIncome: 0,
       provisionCost: 0, writeOff: 0, outflow: 0, ncf: 0, cum: 0,
       depositBalance: 0, loanBook: 0, cumMargin: 0, events: [],
     });
   }
+  const depBal = new Array(H + 1).fill(0) as number[]; // مانده سپرده پایان ماه
+  const loanBal = new Array(H + 1).fill(0) as number[]; // مانده ناخالص تسهیلات پایان ماه
+  const ev = (t: number, e: AlmFlowEvent) => rows[t].events.push(e);
 
   const tierResults: AlmTierResult[] = [];
-  let totalCommitment = 0, totalWithdrawal = 0, totalPmt = 0, totalIncome = 0;
-  let totalProfitPaid = 0, totalProvision = 0, totalWriteOff = 0, interbankCost = 0;
-  let borrowers = 0, peakOutflow = 0, peakMonth = 0;
-  let cum = 0, cumMargin = 0;
-  let depositBalance = 0, loanBook = 0;
-  let reserveHeld = 0, netDeposit = 0;
+  let totalCommitment = 0, totalWithdrawal = 0, totalPmt = 0, totalIncome = 0, pmtBeyond = 0;
+  let totalProvision = 0, totalWriteOff = 0, borrowers = 0;
+  let walANum = 0, walADen = 0, walLNum = 0, walLDen = 0;
 
   for (let i = 0; i < tiers.length; i++) {
     const tier = tiers[i];
-    const tierDepositShare = tier.expectedTakeUpShare / totalShare;
-    const tierDeposit = totalDeposit * tierDepositShare;
-    const tierCustomers = Math.round(nCustomers * tierDepositShare);
+    const id = tier.id ?? `t${i}`;
+    const base = { tierId: id, tierName: tier.name, tierIndex: i, vintageMonth: 0 };
+    const share = shareOf(tier);
+    const D = totalDeposit * share;
+    const tierCustomers = Math.round(nCustomers * share);
+    const tDep = Math.max(0, Math.round(tier.waitingMonths));
+    const n = Math.max(1, Math.round(tier.repaymentMonths));
     const rate = tier.rate;
-    const tDep = tier.waitingMonths;
-    const tLoan = tier.repaymentMonths;
-    const alphaPct = tier.loanToAvgDepositPct;
-    const alphaEff = Math.min(alphaPct, (pts.individualLoanCap / 1000) / Math.max(0.001, avgTicket)) * (tier.minAvgDeposit / 1000 <= avgTicket ? 1 : 0);
-    const alphaDecimal = alphaEff / 100;
-    const capBinding = alphaPct > (pts.individualLoanCap / 1000) / Math.max(0.001, avgTicket);
-    const eligible = avgTicket >= tier.minAvgDeposit / 1000 && alphaEff > 0;
+    const capPct = ((pts.individualLoanCap / 1000) / avgTicket) * 100; // سقف فردی بر حسب درصد میانگین سپرده
+    const depositOk = avgTicket >= tier.minAvgDeposit / 1000;
+    const alphaEff = depositOk ? Math.max(0, Math.min(tier.loanToAvgDepositPct, capPct)) : 0;
+    const capBinding = depositOk && tier.loanToAvgDepositPct > capPct;
+    const eligible = depositOk && alphaEff > 0;
+    const disbursed = eligible && tDep <= H;
     const lends = eligible;
 
-    // ورود سپرده در ماه ۰ (ورود یکجا - برای سادگی می‌توان در نسخه بعدی زمان‌بندی uniform/custom اضافه کرد)
-    const depMonth = 0;
-    const depositGross = tierDeposit;
-    const reserve = depositGross * (reserveRatioPct / 100);
-    const depNet = depositGross - reserve;
-    if (depMonth <= H) {
-      rows[depMonth].depositGross += depositGross;
-      rows[depMonth].reserveHeld += reserve;
-      rows[depMonth].depositNet += depNet;
-      depositBalance += depositGross;
-      reserveHeld += reserve;
-      netDeposit += depNet;
-      rows[depMonth].events.push({
-        type: "deposit", tierId: tier.id!, tierName: tier.name, tierIndex: i, amount: depositGross, vintageMonth: depMonth,
-      });
-      rows[depMonth].events.push({
-        type: "reserve", tierId: tier.id!, tierName: tier.name, tierIndex: i, amount: reserve, vintageMonth: depMonth,
-      });
+    // ورود سپرده در ماه ۰
+    const reserve = D * rr;
+    rows[0].depositGross += D;
+    rows[0].reserveHeld += reserve;
+    rows[0].depositNet += D - reserve;
+    ev(0, { type: "deposit", ...base, amount: D });
+    ev(0, { type: "reserve", ...base, amount: reserve });
+
+    // برداشت ناخالص در پایان انتظار (وام‌گیرندگان runoff، بقیه churn)
+    const wFrac = eligible ? borrowerShare * runoff + (1 - borrowerShare) * churn : churn;
+    const W = D * wFrac;
+    const C = eligible ? D * borrowerShare * (alphaEff / 100) : 0;
+    const tW = Math.min(tDep, H + 1);
+
+    // مانده سپرده و سود ماه‌شمار (پرداخت پایان هر ماه روی مانده ابتدای ماه)
+    for (let t = 0; t <= H; t++) {
+      const balance = t >= tW ? D - W : D;
+      depBal[t] += balance;
+      if (t >= 1) {
+        const opening = t - 1 >= tW ? D - W : D;
+        rows[t].profitPaid += (opening * pts.depositRate) / 1200;
+      }
     }
 
-    // محاسبه تعهد و خروج در سررسید انتظار
-    const commitment = lends ? depNet * (takeUpRatePct / 100) * (approvalRatePct / 100) * alphaDecimal : 0;
-    const withdrawal = lends
-      ? depNet * ((takeUpRatePct / 100) * (runoffRatePct / 100) + (1 - takeUpRatePct / 100) * (churnRatePct / 100))
-      : depNet * (churnRatePct / 100);
+    if (tW <= H && W > 0) {
+      rows[tW].withdrawalOut += W;
+      rows[tW].reserveRelease += W * rr;
+      ev(tW, { type: "withdrawal", ...base, amount: W });
+      ev(tW, { type: "release", ...base, amount: W * rr });
+      walLNum += tW * W;
+      walLDen += W;
+    }
+    // باقی‌مانده سپرده در افق سررسید فرض می‌شود (برای WAL بدهی)
+    walLNum += H * (D - (tW <= H ? W : 0));
+    walLDen += D - (tW <= H ? W : 0);
 
-    // نرخ نکول و ذخیره (از پارامتر محصول)
-    const pd = clamp(cfg.risk.minScore < 550 ? 0.08 : 0.04, 0.005, 0.2);
-    const lgd = 0.65;
-    const provision = commitment * pd * lgd;
-    const writeOff = provision; // در پایان افق سوخت می‌شود (ساده‌سازی)
-
-    // اقساط
-    const monthlyPmt = pmtFor(isQard ? "qard" : "murabaha", commitment, rate, tLoan);
-    const totalRepay = monthlyPmt * tLoan;
-    const totalIncomeTier = totalRepay - commitment;
-    const pmtPerMonth = monthlyPmt;
-
-    const disbMonth = Math.min(H, tDep);
-    if (disbMonth <= H) {
-      rows[disbMonth].loanOut += commitment;
-      rows[disbMonth].withdrawalOut += withdrawal;
-      loanBook += commitment;
-      // سود ماه‌شمار روی مانده سپرده تا این ماه
-      for (let m = depMonth; m < disbMonth && m <= H; m++) {
-        const avgBal = depositBalance; // ساده‌سازی
-        const profit = avgBal * (pts.depositRate / 100) / 12 * tierDepositShare;
-        rows[m].profitPaid += profit;
-        totalProfitPaid += profit;
-      }
-      rows[disbMonth].events.push({
-        type: "loan", tierId: tier.id!, tierName: tier.name, tierIndex: i, amount: commitment,
-        vintageMonth: depMonth, instFrom: disbMonth, instTo: Math.min(H, disbMonth + tLoan - 1), instTotal: tLoan,
-      });
-      rows[disbMonth].events.push({
-        type: "withdrawal", tierId: tier.id!, tierName: tier.name, tierIndex: i, amount: withdrawal, vintageMonth: depMonth,
-      });
-      rows[disbMonth].provisionCost += provision;
+    let unitPay = 0;
+    let totalRepayTier = 0;
+    let totalIncomeTier = 0;
+    let provision = 0;
+    if (disbursed && C > 0) {
+      const sch = splitSchedule(contract, C, rate, n);
+      unitPay = sch.pmt;
+      totalRepayTier = sch.pmt * n;
+      totalIncomeTier = sum(sch.inc);
+      rows[tDep].loanOut += C;
+      ev(tDep, { type: "loan", ...base, amount: C, instFrom: tDep + 1, instTo: Math.min(H, tDep + n), instTotal: n });
+      provision = C * el;
+      rows[tDep].provisionCost += provision;
       totalProvision += provision;
-    }
-
-    // اقساط ماهانه
-    for (let k = 0; k < tLoan; k++) {
-      const m = disbMonth + k;
-      if (m > H) break;
-      let principal = 0; let income = 0;
-      if (isQard) {
-        principal = commitment / tLoan;
-        income = (commitment * (rate / 100) * (tLoan / 12)) / tLoan; // کارمزد توزیع یکنواخت
-      } else {
-        const rm = rate / 100 / 12;
-        const balStart = k === 0 ? commitment : (rows[m-1] ? (loanBook - commitment) : commitment); // ساده‌سازی
-        const interest = commitment * rm * Math.pow(1 + rm, k) / (Math.pow(1 + rm, tLoan) - 1);
-        principal = pmtPerMonth - interest;
-        income = interest;
+      if (provision > 0) ev(tDep, { type: "provision", ...base, amount: provision });
+      for (let t = tDep; t <= H; t++) loanBal[t] += C;
+      for (let k = 0; k < n; k++) {
+        const t = tDep + 1 + k;
+        const cash = sch.pmt * (1 - el);
+        walANum += t * sch.prin[k];
+        walADen += sch.prin[k];
+        if (t > H) {
+          pmtBeyond += cash;
+          continue;
+        }
+        rows[t].pmtInflow += cash;
+        rows[t].principalIn += sch.prin[k] * (1 - el);
+        rows[t].incomeIn += sch.inc[k] * (1 - el);
+        totalPmt += cash;
+        totalIncome += sch.inc[k] * (1 - el);
+        // مانده ناخالص قراردادی پس از قسط k
+        for (let s = t; s <= H; s++) loanBal[s] += -sch.prin[k];
+        ev(t, { type: "pmt", ...base, amount: cash, instFrom: k + 1, instTo: k + 1, instTotal: n });
       }
-      rows[m].pmtInflow += pmtPerMonth;
-      rows[m].principalIn += principal;
-      rows[m].incomeIn += income;
-      if (m <= H) loanBook = Math.max(0, loanBook - principal);
-      totalPmt += pmtPerMonth;
-      totalIncome += income;
-      if (m <= H) {
-        rows[m].events.push({
-          type: "pmt", tierId: tier.id!, tierName: tier.name, tierIndex: i, amount: pmtPerMonth,
-          vintageMonth: depMonth, instFrom: m, instTo: m, instTotal: 1,
-        });
+      const maturity = tDep + n;
+      if (maturity <= H && provision > 0) {
+        rows[maturity].writeOff += provision;
+        totalWriteOff += provision;
+        ev(maturity, { type: "writeoff", ...base, amount: provision });
       }
+      totalCommitment += C;
     }
+    totalWithdrawal += tW <= H ? W : 0;
+    const tierBorrowers = eligible ? Math.round(tierCustomers * borrowerShare) : 0;
+    borrowers += disbursed ? tierBorrowers : 0;
 
-    // آزادسازی سپرده قانونی در زمان خروج
-    const withMonth = Math.min(H, disbMonth);
-    if (withMonth <= H) {
-      const resRel = reserve;
-      rows[withMonth].reserveRelease += resRel;
-      reserveHeld -= resRel;
-      depositBalance -= depositGross * (takeUpRatePct / 100) * (runoffRatePct / 100);
-      depositBalance -= depositGross * (1 - takeUpRatePct / 100) * (churnRatePct / 100);
-    }
-
-    // هزینه فرصت و شکاف منافع برای مشتری
-    const unitDep = avgTicket; // به میلیارد
-    const unitLoan = (alphaEff / 100) * unitDep;
-    const unitPmt = pmtFor(isQard ? "qard" : "murabaha", unitLoan, rate, tLoan);
-    const oppCost = unitDep * ((opportunityRatePct - pts.depositRate) / 100) * (tDep / 12);
-    const custEffCost = unitPmt * tLoan + oppCost - unitDep * (pts.depositRate / 100) * (tDep / 12);
-    // IRR ساده مشتری
-    const custIrr = unitLoan > 0 && unitPmt > 0 ? ((unitPmt * tLoan - unitLoan) / unitLoan) * (12 / tLoan) * 100 : 0;
-    const interestGap = rate - custIrr; // مثبت یعنی سود بانک بیشتر از نرخ اسمی
+    // سنجه‌های مشتری نمونه (میلیون تومان)
+    const B = avgTicketMillionToman;
+    const unitLoan = (alphaEff / 100) * B;
+    const unitPmt = unitLoan > 0 ? pmtFor(contract, unitLoan, rate, n) : 0;
+    const allIn = customerAllInCost(unitLoan, B, tDep, unitPmt, n, opportunityRatePct, pts.depositRate);
 
     tierResults.push({
-      tier, index: i, share: tierDepositShare * 100,
-      deposit: tierDeposit, alphaEff, capBinding, repBalance: commitment,
-      eligible, lends, effectiveRate: rate, commitment, withdrawal,
-      monthlyPmt: pmtPerMonth, totalRepay, totalIncome: totalIncomeTier,
-      borrowers: Math.round(tierCustomers * (takeUpRatePct / 100) * (approvalRatePct / 100)),
-      firstMaturity: disbMonth, lastMaturity: disbMonth + tLoan,
-      unitPay: unitPmt, customerOpportunityCost: oppCost * 1000, // میلیون تومان
-      customerEffectiveCost: custEffCost * 1000, customerIrr: custIrr, interestGap,
+      tier, index: i, share: share * 100,
+      deposit: D, alphaEff, capBinding, repBalance: C,
+      eligible, lends, effectiveRate: rate, commitment: C, withdrawal: W,
+      monthlyPmt: unitPay, totalRepay: totalRepayTier, totalIncome: totalIncomeTier,
+      borrowers: tierBorrowers,
+      customers: tierCustomers,
+      firstMaturity: disbursed ? tDep + 1 : null,
+      lastMaturity: disbursed ? tDep + n : null,
+      unitPay: unitPmt,
+      customerOpportunityCost: allIn.opportunityCost,
+      customerEffectiveCost: unitPmt * n + allIn.opportunityCost,
+      customerIrr: allIn.cost,
+      interestGap: allIn.cost - opportunityRatePct,
     });
-    totalCommitment += commitment;
-    totalWithdrawal += withdrawal;
-    borrowers += Math.round(tierCustomers * (takeUpRatePct / 100) * (approvalRatePct / 100));
   }
 
-  // نهایی‌سازی ردیف‌های ماهانه و محاسبه NCF و Cum
+  // نهایی‌سازی ردیف‌ها: NCF، کسری انباشته و هزینه بین‌بانکی
+  // کسری ماه قبل با نرخ بین‌بانکی تأمین می‌شود و مازاد ماه قبل با نرخ FTP در خزانه سرمایه‌گذاری می‌شود
+  const surplusRate = Math.max(0, inp.surplusRatePct ?? cfg.funding.costOfFunds);
+  let cum = 0, cumMargin = 0, interbankCost = 0, surplusIncome = 0, peakOutflow = 0, peakMonth = 0;
   for (let t = 0; t <= H; t++) {
     const r = rows[t];
-    r.inflow = r.depositNet + r.pmtInflow + r.reserveRelease;
-    r.outflow = r.loanOut + r.withdrawalOut + r.profitPaid + r.fundingCost;
+    r.fundingCost = t > 0 && cum < 0 ? (-cum * inp.interbankRatePct) / 1200 : 0;
+    r.surplusIncome = t > 0 && cum > 0 ? (cum * surplusRate) / 1200 : 0;
+    interbankCost += r.fundingCost;
+    surplusIncome += r.surplusIncome;
+    // درآمد مازاد در سود و زیان (cumMargin/netMargin) می‌آید، نه در نقدینگی مستقل محصول؛
+    // تا حفره نقدینگی ساختاری محصول با درآمد خزانه پوشانده نشود (رویکرد محافظه‌کارانه).
+    r.inflow = r.depositGross + r.pmtInflow + r.reserveRelease;
+    r.outflow = r.reserveHeld + r.loanOut + r.withdrawalOut + r.profitPaid + r.fundingCost;
     r.ncf = r.inflow - r.outflow;
     cum += r.ncf;
     r.cum = cum;
-    r.depositBalance = depositBalance;
-    r.loanBook = loanBook;
-    // هزینه تأمین بین‌بانکی برای کسری
-    if (cum < 0) {
-      r.fundingCost = (-cum) * (interbankRatePct / 100) / 12;
-      interbankCost += r.fundingCost;
-      cum += r.ncf; // r.cum به‌روز شد
-      r.outflow += r.fundingCost;
-      r.cum = cum;
-    }
-    cumMargin += r.incomeIn - r.profitPaid - r.fundingCost - r.provisionCost;
+    r.depositBalance = depBal[t];
+    r.loanBook = Math.max(0, loanBal[t]);
+    cumMargin += r.incomeIn + r.surplusIncome - r.profitPaid - r.fundingCost - r.provisionCost;
     r.cumMargin = cumMargin;
-    if (t === H) totalWriteOff += totalProvision * 0.5; // فرض سوخت نهایی ۵۰٪ ذخایر
-    const outflowT = r.outflow;
-    if (outflowT > peakOutflow) {
-      peakOutflow = outflowT;
+    if (r.outflow > peakOutflow) {
+      peakOutflow = r.outflow;
       peakMonth = t;
     }
   }
+  const totalProfitPaid = sum(rows.map((r) => r.profitPaid));
 
-  // محاسبه KPIهای نقدینگی
-  let minCum = Infinity, minCumMonth = -1, maxHole = 0;
+  // KPIهای نقدینگی
+  let minCum = Infinity, minCumMonth = 0, maxHole = 0, deficitMonths = 0;
   let tippingPoint: number | null = null;
   let recoveryMonth: number | null = null;
-  let deficitMonths = 0;
   for (let t = 0; t <= H; t++) {
     const c = rows[t].cum;
     if (c < minCum) { minCum = c; minCumMonth = t; }
-    if (c < 0) {
+    if (c < -1e-9) {
       maxHole = Math.max(maxHole, -c);
       deficitMonths++;
       if (tippingPoint === null) tippingPoint = t;
-    } else if (c >= 0 && tippingPoint !== null && recoveryMonth === null) {
+      recoveryMonth = null;
+    } else if (tippingPoint !== null && recoveryMonth === null) {
       recoveryMonth = t;
     }
   }
-  const endCum = rows[H].cum;
-  const leverage = netDeposit > 0 ? (totalCommitment + totalWithdrawal) / netDeposit : Infinity;
+  const netDeposit = totalDeposit * (1 - rr);
+  const leverage = netDeposit > 0 ? (totalCommitment + totalWithdrawal) / netDeposit : RATIO_CAP;
   const netInterestIncome = totalIncome - totalProfitPaid;
-  const netMargin = netInterestIncome - interbankCost - totalProvision;
-  const marginOnNet = netDeposit !== 0 ? (netMargin / netDeposit) * 100 : (netMargin >= 0 ? Infinity : -Infinity);
+  const netMargin = netInterestIncome + surplusIncome - interbankCost - totalProvision;
+  const marginOnNet = netDeposit > 0 ? (netMargin / netDeposit) * 100 : 0;
 
-  // سنجه‌های مقرراتی آموزشی
-  // LCR ساده: HQLA ≈ CumLiq مثبت، خروج استرس = با فرض ۳۰ روز
-  let minLcr = Infinity;
-  for (let t = 1; t <= H; t++) {
-    const out30 = rows[t].outflow + 0.05 * Math.max(0, rows[t].depositBalance);
-    if (out30 > 0) {
-      const lcr = Math.max(0, rows[t].cum) / out30 * 100;
-      if (lcr < minLcr) minLcr = lcr;
-    }
+  // LCR آموزشی (رو به جلو، ۳۰ روز): HQLA = مازاد نقد؛ خروج = خروج قراردادی ماه بعد + ۵٪ فرار سپرده؛
+  // ورود = ۵۰٪ اقساط ماه بعد و حداکثر ۷۵٪ خروج (مطابق ساختار بازل ۳).
+  let minLcr = RATIO_CAP;
+  for (let t = 0; t < H; t++) {
+    const nx = rows[t + 1];
+    const out30 = nx.loanOut + nx.withdrawalOut + nx.profitPaid + 0.05 * rows[t].depositBalance;
+    const in30 = Math.min(0.5 * nx.pmtInflow, 0.75 * out30);
+    const netOut = out30 - in30;
+    if (netOut > 1e-9) minLcr = Math.min(minLcr, (Math.max(0, rows[t].cum) / netOut) * 100);
   }
-  // NSFR در ماه ۱۲ (درصد)
+  // NSFR آموزشی در ماه ۱۲: ASF = ۹۰٪ سپرده خرد، RSF = ۸۵٪ تسهیلات (وزن ریسک > ۳۵٪)
   const r12 = rows[Math.min(12, H)];
-  const nsfr = r12.loanBook > 0 ? (r12.depositBalance * 0.9) / (r12.loanBook * 0.85) * 100 : 0;
-  // WAL (میانگین وزنی سررسید) ساده
-  let walA = 0, walL = 0, wA = 0, wL = 0;
-  for (const tr of tierResults) {
-    if (tr.commitment > 0) {
-      walA += (tr.firstMaturity! + tr.tier.repaymentMonths / 2) * tr.commitment;
-      wA += tr.commitment;
-    }
-    if (tr.withdrawal > 0) {
-      walL += tr.firstMaturity! * tr.withdrawal;
-      wL += tr.withdrawal;
-    }
-  }
-  const walAssets = wA > 0 ? walA / wA : 0;
-  const walLiabilities = wL > 0 ? walL / wL : 0;
-  const maturityGap = walAssets - walLiabilities;
+  const rsf = 0.85 * r12.loanBook;
+  const nsfr = rsf > 1e-9 ? Math.min(RATIO_CAP, ((0.9 * r12.depositBalance) / rsf) * 100) : RATIO_CAP;
+  const walAssets = walADen > 0 ? walANum / walADen : 0;
+  const walLiabilities = walLDen > 0 ? walLNum / walLDen : 0;
 
   const kpis: AlmKpis = {
-    totalDeposit, netDeposit, reserveHeld, totalCommitment, totalWithdrawal, leverage,
+    totalDeposit, netDeposit, reserveHeld: rows[0].reserveHeld, totalCommitment, totalWithdrawal, leverage,
     minCum: minCum === Infinity ? 0 : minCum, minCumMonth, maxHole, tippingPoint,
-    recoveryMonth, deficitMonths, endCum, totalPmtInHorizon: totalPmt,
-    totalIncomeInHorizon: totalIncome, pmtBeyondHorizon: 0,
-    interbankCost, borrowers, peakOutflow, peakOutflowMonth: peakMonth,
+    recoveryMonth, deficitMonths, endCum: rows[H].cum, totalPmtInHorizon: totalPmt,
+    totalIncomeInHorizon: totalIncome, pmtBeyondHorizon: pmtBeyond,
+    interbankCost, surplusIncome, borrowers, peakOutflow, peakOutflowMonth: peakMonth,
     totalProfitPaid, netInterestIncome, totalProvision, totalWriteOff, netMargin,
-    marginOnNetDeposit: marginOnNet, minLcr: minLcr === Infinity ? 0 : minLcr,
-    nsfrAt12: nsfr, walAssets, walLiabilities, maturityGap,
+    marginOnNetDeposit: marginOnNet, minLcr, nsfrAt12: nsfr, walAssets, walLiabilities,
+    maturityGap: walAssets - walLiabilities,
   };
 
-  // گزینه‌های مشتری (برای یک مشتری با میانگین سپرده معیار ۱۰۰ میلیون)
-  const customerOptions = generateNeginOptions(100, cfg, opportunityRatePct);
+  const customerOptions = inp.withOptions === false ? [] : generateNeginOptions(100, cfg, opportunityRatePct);
   const paretoFrontier = customerOptions.filter((o) => o.paretoOptimal);
 
-  return {
-    rows, tiers: tierResults, kpis, customerOptions, paretoFrontier,
-    durationMs: Date.now() - t0,
-  };
+  return { rows, tiers: tierResults, kpis, customerOptions, paretoFrontier, durationMs: Date.now() - t0 };
 }
 
 // --------------- تحلیل استرس، گردبادی و مونت‌کارلو ALM ---------------
 
-export function runAlmStressGrid(baseInput: AlmSimInput, paramOverrides: Partial<AlmSimInput>[]): {
-  results: AlmResult[];
-  tornado?: import("./types").TornadoItem[];
-} {
-  const results: AlmResult[] = [];
-  for (const ov of paramOverrides) {
-    results.push(simulateAlm({ ...baseInput, ...ov }));
+const quick = (inp: AlmSimInput): AlmSimInput => ({ ...inp, withOptions: false });
+
+export function runAlmStressGrid(
+  baseInput: AlmSimInput,
+  takeUpShocks: number[] = [-30, -15, 0, 15, 30],
+  approvalShocks: number[] = [-20, -10, 0, 10, 20],
+): LiquidityStressCell[] {
+  const cells: LiquidityStressCell[] = [];
+  for (const tu of takeUpShocks) {
+    for (const ap of approvalShocks) {
+      const res = simulateAlm(quick({
+        ...baseInput,
+        takeUpRatePct: clamp(baseInput.takeUpRatePct + tu, 0, 100),
+        approvalRatePct: clamp(baseInput.approvalRatePct + ap, 0, 100),
+      }));
+      cells.push({
+        takeUpShock: tu, approvalShock: ap, maxHole: res.kpis.maxHole, tippingPoint: res.kpis.tippingPoint,
+        netMargin: res.kpis.netMargin, leverage: res.kpis.leverage,
+      });
+    }
   }
-  return { results };
+  return cells;
 }
 
-export function runAlmTornado(baseInput: AlmSimInput): import("./types").TornadoItem[] {
-  const base = simulateAlm(baseInput);
-  const shocks: { key: string; label: string; lowLabel: string; highLabel: string; prop: keyof AlmSimInput; delta: number }[] = [
-    { key: "takeUp", label: "نرخ تقاضای وام", lowLabel: "-۲۰٪", highLabel: "+۲۰٪", prop: "takeUpRatePct", delta: 20 },
-    { key: "approval", label: "نرخ تأیید", lowLabel: "-۲۰٪", highLabel: "+۲۰٪", prop: "approvalRatePct", delta: 20 },
-    { key: "runoff", label: "نرخ خروج وام‌گیرندگان", lowLabel: "-۲۰٪", highLabel: "+۲۰٪", prop: "runoffRatePct", delta: 20 },
-    { key: "churn", label: "نرخ ریزش انصرافی‌ها", lowLabel: "-۲۰٪", highLabel: "+۲۰٪", prop: "churnRatePct", delta: 20 },
-    { key: "interbank", label: "نرخ بین‌بانکی", lowLabel: "-۴٪", highLabel: "+۴٪", prop: "interbankRatePct", delta: 4 },
-    { key: "reserve", label: "سپرده قانونی", lowLabel: "-۲٪", highLabel: "+۲٪", prop: "reserveRatioPct", delta: 2 },
+export function runAlmTornado(baseInput: AlmSimInput): TornadoItem[] {
+  const base = simulateAlm(quick(baseInput));
+  const shocks: { key: string; label: string; lowLabel: string; highLabel: string; prop: keyof AlmSimInput; delta: number; max: number }[] = [
+    { key: "takeUp", label: "نرخ تقاضای وام", lowLabel: "−۲۰ واحد", highLabel: "+۲۰ واحد", prop: "takeUpRatePct", delta: 20, max: 100 },
+    { key: "approval", label: "نرخ تأیید", lowLabel: "−۲۰ واحد", highLabel: "+۲۰ واحد", prop: "approvalRatePct", delta: 20, max: 100 },
+    { key: "runoff", label: "نرخ خروج وام‌گیرندگان", lowLabel: "−۲۰ واحد", highLabel: "+۲۰ واحد", prop: "runoffRatePct", delta: 20, max: 100 },
+    { key: "churn", label: "نرخ ریزش سایر سپرده‌گذاران", lowLabel: "−۲۰ واحد", highLabel: "+۲۰ واحد", prop: "churnRatePct", delta: 20, max: 100 },
+    { key: "interbank", label: "نرخ بین‌بانکی", lowLabel: "−۴ واحد", highLabel: "+۴ واحد", prop: "interbankRatePct", delta: 4, max: 200 },
+    { key: "reserve", label: "سپرده قانونی", lowLabel: "−۲ واحد", highLabel: "+۲ واحد", prop: "reserveRatioPct", delta: 2, max: 100 },
   ];
-  const tornado: import("./types").TornadoItem[] = [];
+  const tornado: TornadoItem[] = [];
   for (const s of shocks) {
-    const lowInp = { ...baseInput };
-    (lowInp as any)[s.prop] = Math.max(0, (baseInput[s.prop] as number) - s.delta);
-    const highInp = { ...baseInput };
-    (highInp as any)[s.prop] = Math.min(100, (baseInput[s.prop] as number) + s.delta);
-    const lowRes = simulateAlm(lowInp);
-    const highRes = simulateAlm(highInp);
-    const low = lowRes.kpis.maxHole;
-    const high = highRes.kpis.maxHole;
+    const v = baseInput[s.prop] as number;
+    const low = simulateAlm(quick({ ...baseInput, [s.prop]: Math.max(0, v - s.delta) })).kpis.maxHole;
+    const high = simulateAlm(quick({ ...baseInput, [s.prop]: Math.min(s.max, v + s.delta) })).kpis.maxHole;
     const baseVal = base.kpis.maxHole;
-    const swing = Math.max(low, high, baseVal) - Math.min(low, high, baseVal);
     tornado.push({
-      key: s.key, label: s.label, lowLabel: s.lowLabel, highLabel: s.highLabel,
-      low, high, base: baseVal, swing,
+      key: s.key, label: s.label, lowLabel: s.lowLabel, highLabel: s.highLabel, low, high, base: baseVal,
+      swing: Math.max(low, high, baseVal) - Math.min(low, high, baseVal),
     });
   }
-  tornado.sort((a, b) => b.swing - a.swing);
-  return tornado;
+  return tornado.sort((a, b) => b.swing - a.swing);
 }
 
 export function runAlmMonteCarlo(baseInput: AlmSimInput, runs: number = 200, intensity: number = 50, seed?: number): {
@@ -538,13 +590,14 @@ export function runAlmMonteCarlo(baseInput: AlmSimInput, runs: number = 200, int
   worstCaseMaxHole: number;
   samples: number[];
 } {
+  const R = Math.max(1, Math.round(runs));
   const rng = mulberry32(seed ?? 1405);
   const holes: number[] = [];
   let tippingCount = 0;
   let lossCount = 0;
-  for (let i = 0; i < runs; i++) {
-    const inp: AlmSimInput = { ...baseInput };
-    const shock = intensity / 100;
+  const shock = intensity / 100;
+  for (let i = 0; i < R; i++) {
+    const inp: AlmSimInput = quick({ ...baseInput });
     inp.takeUpRatePct = clamp(inp.takeUpRatePct + normal(rng) * shock * 20, 0, 100);
     inp.approvalRatePct = clamp(inp.approvalRatePct + normal(rng) * shock * 15, 0, 100);
     inp.runoffRatePct = clamp(inp.runoffRatePct + normal(rng) * shock * 15, 0, 100);
@@ -556,95 +609,105 @@ export function runAlmMonteCarlo(baseInput: AlmSimInput, runs: number = 200, int
     if (res.kpis.netMargin < 0) lossCount++;
   }
   holes.sort((a, b) => a - b);
-  const idx = (p: number) => clamp(Math.floor(p * runs), 0, runs - 1);
   return {
-    runs,
-    pTipping: (tippingCount / runs) * 100,
-    pLoss: (lossCount / runs) * 100,
-    p5: holes[idx(0.05)],
-    p50: holes[idx(0.5)],
-    p95: holes[idx(0.95)],
-    p99: holes[idx(0.99)],
-    worstCaseMaxHole: holes[runs - 1],
+    runs: R,
+    pTipping: (tippingCount / R) * 100,
+    pLoss: (lossCount / R) * 100,
+    p5: quantile(holes, 0.05),
+    p50: quantile(holes, 0.5),
+    p95: quantile(holes, 0.95),
+    p99: quantile(holes, 0.99),
+    worstCaseMaxHole: holes[R - 1],
     samples: holes,
   };
 }
 
-/** بهینه‌یاب معکوس پله‌ها: جست‌وجو برای یافتن تخصیص بهینه با قیود نقدینگی */
+/** گردکردن سهم‌ها به اعداد صحیح با مجموع دقیق ۱۰۰ (روش بزرگ‌ترین باقی‌مانده). */
+export function roundShares(weights: number[]): number[] {
+  const total = sum(weights);
+  if (!(total > 0)) return weights.map((_, i) => (i === 0 ? 100 : 0));
+  const raw = weights.map((w) => (w / total) * 100);
+  const out = raw.map(Math.floor);
+  const order = raw.map((v, i) => [v - Math.floor(v), i] as const).sort((a, b) => b[0] - a[0]);
+  for (let k = 0; k < 100 - sum(out); k++) out[order[k % order.length][1]]++;
+  return out;
+}
+
+/**
+ * بهینه‌یاب معکوس پله‌ها: سهم پله‌ها با پارامتر «شیب انتظار» θ جابه‌جا می‌شود
+ * (sᵢ ∝ s⁰ᵢ · e^{θ·zᵢ} که zᵢ انتظار استانداردشده است) و بهترین طرح امکان‌پذیر گزارش می‌شود.
+ * برای هر تعداد پله کار می‌کند.
+ */
 export function inverseTierDesigner(
   baseInput: AlmSimInput,
   constraints: { maxHoleBillion?: number; minMarginPct?: number; maxLeverage?: number; targetObjective?: "margin" | "liquidity" | "reach" } = {},
 ) {
   const cfg = JSON.parse(JSON.stringify(baseInput.cfg)) as ProductConfig;
-  const originalTiers = cfg.points.tiers;
+  const originalTiers = cfg.points.tiers ?? [];
+  if (originalTiers.length < 2) return null;
+  const waits = originalTiers.map((t) => t.waitingMonths);
+  const mu = sum(waits) / waits.length;
+  const sd = Math.sqrt(sum(waits.map((w) => (w - mu) ** 2)) / waits.length) || 1;
+  const baseShares = originalTiers.map((t) => Math.max(1, t.expectedTakeUpShare));
   let best: { score: number; res: AlmResult; violations: string[]; tiers: TieredMurabahaTier[] } | null = null;
-
-  // جست‌وجوی شبکه‌ای روی سهم‌های تخصیص
-  const shareGrid = [5, 10, 15, 20, 25, 30];
-  for (let s0 = 5; s0 <= 40; s0 += 5) {
-    for (let s6 = 2; s6 <= 15; s6 += 1) {
-      const remaining = 100 - s0 - s6;
-      const rest = [0.2, 0.18, 0.14, 0.1, 0.07];
-      if (remaining < 30) continue;
-      const shares = [s0, ...rest.map((_r, i) => i === rest.length - 1 ? remaining - sum(rest.slice(0, -1).map(rrest => rrest * remaining)) : Math.round(_r * remaining)), s6];
-      // اطمینان از مجموع ۱۰۰
-      const total = sum(shares);
-      for (let i = 0; i < shares.length; i++) shares[i] = Math.round(shares[i] / total * 100);
-      const diff = 100 - sum(shares);
-      shares[0] += diff;
-      cfg.points.tiers = originalTiers.map((t, i) => ({ ...t, expectedTakeUpShare: shares[i] }));
-      const inp = { ...baseInput, cfg };
-      const res = simulateAlm(inp);
-      const violations: string[] = [];
-      if (constraints.maxHoleBillion && res.kpis.maxHole > constraints.maxHoleBillion) {
-        violations.push(`حداکثر حفره ${res.kpis.maxHole.toFixed(1)} میلیارد بیش از سقف ${constraints.maxHoleBillion} است`);
-      }
-      if (constraints.minMarginPct && res.kpis.marginOnNetDeposit < constraints.minMarginPct) {
-        violations.push(`حاشیه ${res.kpis.marginOnNetDeposit.toFixed(1)}٪ کمتر از حد ${constraints.minMarginPct}٪ است`);
-      }
-      if (constraints.maxLeverage && isFinite(res.kpis.leverage) && res.kpis.leverage > constraints.maxLeverage) {
-        violations.push(`اهرم ${res.kpis.leverage.toFixed(2)} بیش از سقف ${constraints.maxLeverage} است`);
-      }
-      const score = violations.length === 0
-        ? (constraints.targetObjective === "margin" ? res.kpis.netMargin :
-           constraints.targetObjective === "liquidity" ? -res.kpis.maxHole :
-           res.kpis.borrowers)
-        : -violations.length * 1e6 - res.kpis.maxHole;
-      if (!best || score > best.score) {
-        best = { score, res, violations, tiers: cfg.points.tiers };
-      }
+  for (let step = -15; step <= 15; step++) {
+    const theta = step / 10;
+    const shares = roundShares(baseShares.map((s, i) => s * Math.exp(theta * ((waits[i] - mu) / sd))));
+    const tiers = originalTiers.map((t, i) => ({ ...t, expectedTakeUpShare: shares[i] }));
+    const res = simulateAlm(quick({ ...baseInput, cfg: { ...cfg, points: { ...cfg.points, tiers } } }));
+    const violations: string[] = [];
+    if (constraints.maxHoleBillion !== undefined && res.kpis.maxHole > constraints.maxHoleBillion) {
+      violations.push(`حداکثر حفره ${res.kpis.maxHole.toFixed(1)} میلیارد بیش از سقف ${constraints.maxHoleBillion.toFixed(1)} است`);
     }
+    if (constraints.minMarginPct !== undefined && res.kpis.marginOnNetDeposit < constraints.minMarginPct) {
+      violations.push(`حاشیه ${res.kpis.marginOnNetDeposit.toFixed(1)}٪ کمتر از حد ${constraints.minMarginPct}٪ است`);
+    }
+    if (constraints.maxLeverage !== undefined && res.kpis.leverage > constraints.maxLeverage) {
+      violations.push(`اهرم ${res.kpis.leverage.toFixed(2)} بیش از سقف ${constraints.maxLeverage} است`);
+    }
+    const objective =
+      constraints.targetObjective === "liquidity" ? -res.kpis.maxHole :
+      constraints.targetObjective === "reach" ? res.kpis.borrowers :
+      res.kpis.netMargin;
+    const score = violations.length === 0 ? objective : -1e9 * violations.length - res.kpis.maxHole;
+    if (!best || score > best.score) best = { score, res, violations, tiers };
   }
-  return best ? {
-    tiers: best.tiers, objective: best.score, kpis: best.res.kpis, constraintViolations: best.violations,
-  } : null;
+  return best ? { tiers: best.tiers, objective: best.score, kpis: best.res.kpis, constraintViolations: best.violations } : null;
 }
 
 // --------------- ماژول ریسک پیش‌پرداخت ---------------
 
+/**
+ * پیش‌پرداخت عقلایی زمانی رخ می‌دهد که نرخ قرارداد از نرخ بازار بالاتر باشد (انگیزه تأمین مجدد).
+ * وام ارزان‌تر از بازار معمولاً تا سررسید نگه داشته می‌شود؛ پس فقط نرخ پایه اعمال می‌شود.
+ * CPR سالانه به SMM ماهانه تبدیل و درآمد ازدست‌رفته/جریان نقد پیش‌افتاده به‌صورت انتظار دقیق محاسبه می‌شود.
+ */
 export function modelPrepayment(cfg: ProductConfig, res: AlmResult, marketRatePct: number = 23) {
   if (!cfg.prepayment?.enabled) return undefined;
   const pm: PrepaymentModel = cfg.prepayment;
-  let totalPrepayPct = 0;
+  const contract: "qard" | "murabaha" = cfg.contract === "qard" ? "qard" : "murabaha";
+  let weighted = 0;
   let lostIncome = 0;
   let acceleratedCf = 0;
-  let count = 0;
+  const totalC = res.tiers.reduce((s, t) => s + (t.firstMaturity !== null ? t.commitment : 0), 0);
   for (const tr of res.tiers) {
-    if (!tr.lends) continue;
-    const rateGap = Math.max(0, marketRatePct - tr.effectiveRate); // وام ارزان‌تر از بازار = پیش‌پرداخت بیشتر
-    const prepayRate = clamp(pm.baseRate + pm.sensitivityToRateGap * rateGap, 0, pm.maxRate);
-    totalPrepayPct += prepayRate * (tr.commitment / Math.max(0.001, res.kpis.totalCommitment));
-    // درآمد از دست رفته (اقساط باقی‌مانده که نرخش جذاب است و پیش‌پرداخت می‌شود)
-    const remainingIncome = tr.totalIncome * (prepayRate / 100) * 0.5; // میانگین نصف عمر
-    lostIncome += remainingIncome;
-    acceleratedCf += tr.commitment * (prepayRate / 100);
-    count++;
+    if (!tr.lends || tr.firstMaturity === null || tr.commitment <= 0) continue;
+    const gap = Math.max(0, tr.effectiveRate - marketRatePct);
+    const cpr = clamp(pm.baseRate + pm.sensitivityToRateGap * gap, 0, Math.min(100, pm.maxRate)) / 100;
+    const smm = 1 - Math.pow(1 - cpr, 1 / 12);
+    const sch = splitSchedule(contract, tr.commitment, tr.effectiveRate, tr.tier.repaymentMonths);
+    let survive = 1;
+    for (let k = 0; k < sch.n; k++) {
+      // درآمد قسط k فقط اگر وام تا آن ماه پیش‌پرداخت نشده باشد دریافت می‌شود
+      lostIncome += (1 - survive) * sch.inc[k];
+      if (k < sch.n - 1) {
+        acceleratedCf += survive * smm * sch.bal[k];
+        survive *= 1 - smm;
+      }
+    }
+    weighted += cpr * 100 * (totalC > 0 ? tr.commitment / totalC : 0);
   }
-  return {
-    avgPrepaymentRate: count > 0 ? totalPrepayPct : 0,
-    lostInterestIncome: lostIncome,
-    acceleratedCashflow: acceleratedCf,
-  };
+  return { avgPrepaymentRate: weighted, lostInterestIncome: lostIncome, acceleratedCashflow: acceleratedCf };
 }
 
 // --------------- گیمیفیکیشن سفر انتظار ---------------
@@ -652,66 +715,98 @@ export function modelPrepayment(cfg: ProductConfig, res: AlmResult, marketRatePc
 export function buildGamificationJourney(cfg: ProductConfig): GameTierResult[] {
   if (!cfg.gamification?.enabled || !cfg.points.tiers.length) return [];
   const g = cfg.gamification;
-  const pts = cfg.points;
-  const journey: GameTierResult[] = [];
-  let cumulativePoints = 0;
-  for (const tier of pts.tiers) {
-    const extraWait = Math.max(0, tier.waitingMonths - Math.ceil(pts.minHoldingDays / 30));
-    cumulativePoints += extraWait * g.pointsPerExtraWaitMonth;
-    const benefit = tier.rate <= 7 ? "تخفیف ۱۰۰٪ کارمزد + ورود به قرعه‌کشی بزرگ" :
-      tier.loanToAvgDepositPct >= 150 ? "ضریب ۱.۵–۲ برابری تسهیلات" :
-      tier.repaymentMonths >= 48 ? "اقساط فوق‌بلند ۴۸–۶۰ ماهه" : "شروع سفر";
-    journey.push({
-      waitMonths: tier.waitingMonths,
-      pointsEarned: cumulativePoints,
-      benefitUnlocked: benefit,
-      tierName: tier.name,
-      lotteryChancePct: extraWait * g.lotteryChancePerMonth,
+  const minWait = Math.min(...cfg.points.tiers.map((t) => t.waitingMonths));
+  return [...cfg.points.tiers]
+    .sort((a, b) => a.waitingMonths - b.waitingMonths)
+    .map((tier) => {
+      const extraWait = Math.max(0, tier.waitingMonths - minWait);
+      const benefit = tier.rate <= 7 ? "تخفیف کارمزد + ورود به قرعه‌کشی بزرگ" :
+        tier.loanToAvgDepositPct >= 150 ? "ضریب ۱.۵–۲ برابری تسهیلات" :
+        tier.repaymentMonths >= 48 ? "اقساط فوق‌بلند ۴۸–۶۰ ماهه" : "شروع سفر";
+      return {
+        waitMonths: tier.waitingMonths,
+        pointsEarned: extraWait * g.pointsPerExtraWaitMonth,
+        benefitUnlocked: benefit,
+        tierName: tier.name,
+        lotteryChancePct: Math.min(100, extraWait * g.lotteryChancePerMonth),
+      };
     });
-  }
-  return journey;
 }
+
+/** جایزه فرضی هر برنده قرعه‌کشی (میلیارد تومان = ۱ میلیون تومان). */
+const LOTTERY_PRIZE_B = 0.001;
 
 export function calcGamificationImpact(cfg: ProductConfig, res: AlmResult) {
   if (!cfg.gamification?.enabled) return undefined;
-  // تخمین تأثیر گیمیفیکیشن بر اساس افزایش ماندگاری و مشارکت
   const g = cfg.gamification;
-  // فرض: به ازای هر ۵۰ امتیاز در ماه، ۰.۲ واحد درصد نرخ ریزش کاهش می‌یابد
-  const maxPoints = sum(res.tiers.map((t) => Math.max(0, t.tier.waitingMonths - 2))) * g.pointsPerExtraWaitMonth;
-  const retentionUplift = clamp(maxPoints / 50 * 0.2, 1, 15); // تا ۱۵٪ کاهش ریزش
-  const borrowersExtra = res.kpis.borrowers * (retentionUplift / 100);
-  const totalPoints = maxPoints * res.kpis.borrowers / 1000000; // ساده‌سازی
-  const expectedLottery = res.kpis.borrowers * sum(res.tiers.map(t =>
-    Math.max(0, t.tier.waitingMonths - 2) * g.lotteryChancePerMonth / 100)) * 0.001; // جایزه ۰.۰۰۱ میلیارد برای هر برنده
+  // مبنای «انتظار اضافه» کوتاه‌ترین انتظار منوی پله‌هاست
+  const minWait = res.tiers.length ? Math.min(...res.tiers.map((t) => t.tier.waitingMonths)) : 0;
+  let points = 0, lottery = 0, customers = 0, upgraded = 0;
+  for (const t of res.tiers) {
+    const extra = Math.max(0, t.tier.waitingMonths - minWait);
+    const n = t.customers ?? 0;
+    points += n * extra * g.pointsPerExtraWaitMonth;
+    lottery += n * Math.min(1, (extra * g.lotteryChancePerMonth) / 100) * LOTTERY_PRIZE_B;
+    customers += n;
+    if (extra > 0) upgraded += n;
+  }
+  // فرض: هر ۵۰ امتیاز میانگین به ازای مشتری، ۰.۲ واحد درصد ریزش را کم می‌کند (حداکثر ۱۵٪)
+  const avgPoints = customers > 0 ? points / customers : 0;
+  const retentionUplift = clamp((avgPoints / 50) * 0.2, 0, 15);
   return {
-    totalPointsIssued: totalPoints,
-    expectedLotteryPayouts: expectedLottery,
-    tierUpgradeRate: 12 + retentionUplift, // درصد
+    totalPointsIssued: points,
+    expectedLotteryPayouts: lottery,
+    tierUpgradeRate: customers > 0 ? (upgraded / customers) * 100 : 0,
     estimatedRetentionUpliftPct: retentionUplift,
   };
 }
 
 // --------------- ماژول ضدنگین (تسهیلات فوری بدون انتظار) ---------------
 
-export function calcAntiNegin(cfg: ProductConfig, res: AlmResult) {
+/** سهم سپرده جدید از مشتریان «عجول» نسبت به سپرده پایه طرح (فرض آموزشی). */
+export const ANTI_NEGIN_DEPOSIT_SHARE = 0.15;
+
+/**
+ * مشتریان عجول سپرده جدید D_f می‌آورند و همان ماه ۰ وام فوری α_f × D_f می‌گیرند.
+ * سپرده آن‌ها مانند وام‌گیرندگان نگین با نرخ runoff پس از اعطا خارج می‌شود (نگه‌داشتن اجباری = سپرده جبرانی ممنوع)؛
+ * باقی‌مانده در سررسید وام فوری با نرخ churn خارج می‌شود. مانده نقد این جریان در ماه کف نقدینگی طرح پایه، معیار پوشش حفره است.
+ */
+export function calcAntiNegin(
+  cfg: ProductConfig,
+  res: AlmResult,
+  reserveRatioPct = cfg.funding.reserveRatio,
+  churnRatePct = 40,
+  runoffRatePct = 85,
+) {
   if (!cfg.antiNegin?.enabled) return undefined;
   const a = cfg.antiNegin;
-  // فرض: ۱۵٪ از سپرده‌گذاران بالقوه که صبر ندارند، به تسهیلات فوری ۲۳٪ مراجعه می‌کنند
-  const potentialDepositors = res.kpis.totalDeposit / 0.1; // فرض اینکه سپرده نگین ۱۰٪ بازار است
-  const fastDeposits = potentialDepositors * 0.15; // جذب سپرده جدید از طریق این محصول
-  const fastLoanVolume = fastDeposits * (a.fastLoanAlphaPct / 100);
-  const fastPmt = pmtMurabaha(fastLoanVolume, a.fastLoanRate, a.fastLoanTenor);
-  const fastIncome = fastPmt * a.fastLoanTenor - fastLoanVolume;
-  // پوشش حفره: این تسهیلات کوتاه‌مدت و با نرخ بالا هستند و جریان نقد ورودی زودهنگام ایجاد می‌کنند
-  const holeCoverage = Math.min(1, fastIncome / Math.max(0.001, res.kpis.maxHole));
-  return {
-    fastLoanVolume,
-    fastLoanIncome: fastIncome,
-    holeCoverageByFastLoans: holeCoverage * 100,
-  };
+  const rr = reserveRatioPct / 100;
+  const Df = res.kpis.totalDeposit * ANTI_NEGIN_DEPOSIT_SHARE;
+  const L = Df * (a.fastLoanAlphaPct / 100);
+  const n = Math.max(1, Math.round(a.fastLoanTenor));
+  const el = almPd(cfg.risk.minScore) * (COLLATERALS[cfg.risk.collateral] ?? COLLATERALS.scoring).lgd;
+  const sch = splitSchedule("murabaha", L, a.fastLoanRate, n);
+  const H = res.rows.length - 1;
+  const trough = res.kpis.minCumMonth;
+  const runoff = clamp(runoffRatePct, 0, 100) / 100;
+  // سپرده خالص پس از ذخیره قانونی − وام فوری − خروج سپرده پس از اعطا (ذخیره متناظر آزاد می‌شود)
+  let cumAtTrough = Df * (1 - rr) - L - runoff * Df * (1 - rr);
+  let income = 0;
+  for (let k = 0; k < n; k++) {
+    const t = k + 1;
+    if (t > H) break;
+    income += sch.inc[k] * (1 - el);
+    if (t <= trough) cumAtTrough += sch.pmt * (1 - el);
+  }
+  if (n <= trough) cumAtTrough -= (1 - runoff) * Df * (churnRatePct / 100) * (1 - rr);
+  const coverage = res.kpis.maxHole > 1e-9 ? clamp(cumAtTrough / res.kpis.maxHole, 0, 1) : 1;
+  return { fastLoanVolume: L, fastLoanIncome: income, holeCoverageByFastLoans: coverage * 100, cashAtTrough: cumAtTrough };
 }
 
 // --------------- تابع ورودی اصلی برای اجرای کامل همه تحلیل‌ها ---------------
+
+/** بازار هدف سپرده بالقوه: ۵۰ همت = ۵۰٬۰۰۰ میلیارد تومان (فرض آموزشی). */
+export const ALM_MARKET_DEPOSITS_B = 50_000;
 
 export interface FullAlmParams {
   product: ProductConfig;
@@ -721,13 +816,11 @@ export interface FullAlmParams {
   seed?: number;
 }
 
-export function runFullAlmAnalysis(params: FullAlmParams): FullAlmResult {
+export function almBaseInput(params: FullAlmParams): AlmSimInput {
   const { product, marketShare, horizon, seed } = params;
-  // فرض بازار هدف ۵۰ هزار میلیارد تومان سپرده بالقوه
-  const totalDepB = 50 * (marketShare / 100);
   const base: AlmSimInput = {
     cfg: product,
-    totalDepositBillionToman: totalDepB,
+    totalDepositBillionToman: ALM_MARKET_DEPOSITS_B * (marketShare / 100),
     avgTicketMillionToman: 100,
     horizonMonths: horizon,
     takeUpRatePct: product.points.usageRate,
@@ -739,37 +832,46 @@ export function runFullAlmAnalysis(params: FullAlmParams): FullAlmResult {
     reserveRatioPct: product.funding.reserveRatio,
     seed,
   };
+  if (params.scenario === "stress") {
+    base.takeUpRatePct = clamp(base.takeUpRatePct + 15, 0, 100);
+    base.runoffRatePct = clamp(base.runoffRatePct + 10, 0, 100);
+    base.churnRatePct = clamp(base.churnRatePct + 20, 0, 100);
+    base.interbankRatePct += 6;
+  } else if (params.scenario === "fast_growth") {
+    base.totalDepositBillionToman *= 1.5;
+    base.takeUpRatePct = clamp(base.takeUpRatePct + 10, 0, 100);
+    base.approvalRatePct = clamp(base.approvalRatePct + 5, 0, 100);
+  }
+  return base;
+}
+
+export function runFullAlmAnalysis(params: FullAlmParams): FullAlmResult {
+  const base = almBaseInput(params);
+  const product = params.product;
   const alm = simulateAlm(base);
   const tornado = runAlmTornado(base);
-  const mc = runAlmMonteCarlo(base, 300, 50, seed);
-  const opti = inverseTierDesigner(base, { maxHoleBillion: totalDepB * 0.4, minMarginPct: 2, maxLeverage: 2.5, targetObjective: "margin" });
-  const prepayment = modelPrepayment(product, alm);
-  const gamificationJourney = buildGamificationJourney(product);
-  const gamification = calcGamificationImpact(product, alm);
-  const antiNegin = calcAntiNegin(product, alm);
-
+  const stressGrid = runAlmStressGrid(base);
+  const mc = runAlmMonteCarlo(base, 300, 50, params.seed);
+  const opti = inverseTierDesigner(base, {
+    maxHoleBillion: base.totalDepositBillionToman * 0.4, minMarginPct: 2, maxLeverage: 2.5, targetObjective: "margin",
+  });
   return {
     alm,
-    analysis: {
-      stressGrid: [],
-      tornado,
-      monteCarlo: mc,
-      optimalTierDesign: opti ?? undefined,
-    },
-    prepayment,
-    gamification,
-    antiNegin,
-    gamificationJourney,
+    analysis: { stressGrid, tornado, monteCarlo: mc, optimalTierDesign: opti ?? undefined },
+    prepayment: modelPrepayment(product, alm, base.opportunityRatePct),
+    gamification: calcGamificationImpact(product, alm),
+    antiNegin: calcAntiNegin(product, alm, base.reserveRatioPct, base.churnRatePct, base.runoffRatePct),
+    gamificationJourney: buildGamificationJourney(product),
   };
 }
 
-// تابع کمکی برای پرکردن KPI اصلی شبیه‌ساز سیمرغ از نتیجه ALM
+/** پرکردن KPIهای مرتبط سیمرغ از نتیجه ALM (واحدها: میلیارد تومان). */
 export function mergeAlmKpisIntoCore(almKpis: AlmKpis, baseKpis: Kpis): Kpis {
-  const out = { ...baseKpis };
-  out.depositsAvg = almKpis.totalDeposit * 1000; // به میلیون
-  out.fundingCost = almKpis.totalProfitPaid + almKpis.interbankCost;
-  out.fundingBenefit = almKpis.netInterestIncome;
-  out.sourceUseRatio = isFinite(almKpis.leverage) ? 1 / Math.max(0.01, almKpis.leverage) : 0;
-  out.moneyTimeRatio = almKpis.tippingPoint === null ? 100 : Math.max(0, 100 - almKpis.deficitMonths * 3);
-  return out;
+  return {
+    ...baseKpis,
+    depositsAvg: almKpis.totalDeposit,
+    fundingCost: almKpis.totalProfitPaid + almKpis.interbankCost,
+    fundingBenefit: almKpis.netInterestIncome,
+    sourceUseRatio: almKpis.leverage > 0 ? Math.min(RATIO_CAP, 1 / almKpis.leverage) : RATIO_CAP,
+  };
 }

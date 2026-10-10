@@ -4,6 +4,10 @@ import {
   buildSchedule,
   clamp,
   irbRetailK,
+  isTieredPoints,
+  pointsLoanRate,
+  pointsUpfrontFee,
+  tierWeights,
   mean,
   mulberry32,
   normal,
@@ -34,6 +38,7 @@ import type {
   SegmentStat,
   SimParams,
   SimResult,
+  TieredMurabahaTier,
 } from "./types";
 
 export const DEFAULT_PARAMS: SimParams = {
@@ -97,6 +102,25 @@ export interface UnderwriteResult {
   holdMonths: number;
   waitDays: number;
   reducedByDti: boolean;
+  /** index of the chosen tier for tiered (Negin-style) points products, otherwise -1 */
+  tierIndex: number;
+}
+
+/**
+ * Tier chosen by a customer in a tiered points product. Selection follows the expected take-up shares,
+ * down-weighting tiers whose waiting period exceeds the customer's patience (self-selection).
+ */
+export function chooseTier(tiers: TieredMurabahaTier[], u: number, patience: number): number {
+  const base = tierWeights(tiers);
+  const w = base.map((x, i) => x * (tiers[i].waitingMonths <= patience ? 1 : 0.35));
+  const total = w.reduce((a, b) => a + b, 0);
+  if (!(total > 0)) return 0;
+  let acc = 0;
+  for (let i = 0; i < w.length; i++) {
+    acc += w[i] / total;
+    if (u < acc) return i;
+  }
+  return w.length - 1;
 }
 
 const EMP_PD: Record<Employment, number> = { gov: -0.45, private: 0, self: 0.25, retired: -0.35, student: 0.45, unemployed: 0.9 };
@@ -166,14 +190,18 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   const isPoints = k === "points_loan";
   const isLoyalty = k === "loyalty";
   const hybrid = cfg.family === "hybrid";
-  const rate = isPoints ? pt.loanFee : cr.rate;
-  const tenor = Math.max(1, Math.round(cr.tenor));
+  const tierIndex = isTieredPoints(cfg) ? chooseTier(pt.tiers, c.u[5] ?? 0.5, c.patience) : -1;
+  const tier = tierIndex >= 0 ? pt.tiers[tierIndex] : null;
+  const rate = tier ? tier.rate : isPoints ? pointsLoanRate(cfg) : cr.rate;
+  const tenor = Math.max(1, Math.round(tier ? tier.repaymentMonths : cr.tenor));
+  const grace = isPoints ? 0 : cr.grace;
+  const downPct = isPoints ? 0 : cr.downPayment;
   const score = observedScore(c, rk.altData);
   const checks: Check[] = [];
   const drivers: Driver[] = [];
 
   // ----- demand side -----
-  const maxAmt = isPoints ? Math.min(cr.maxAmount, pt.maxLoan) : cr.maxAmount;
+  const maxAmt = isPoints ? Math.min(cr.maxAmount, pt.maxLoan, tier ? pt.individualLoanCap : Infinity) : cr.maxAmount;
   let need = needOverride ?? (isLoyalty ? 0 : c.income * NEED_BASE[k] * PURPOSE_NEED[cfg.purpose] * c.needFactor);
   if (needOverride === undefined && cfg.purpose === "working_capital" && c.employment !== "self") need *= 0.5;
   const seg = segmentFit(cfg.segment, c);
@@ -194,22 +222,31 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   let pointsCap = Infinity;
   if (isPoints) {
     const avail = Math.max(0, (c.balance * 0.8 + c.income * 1.5) * ctx.scenario.depositShift);
-    const minHold = Math.max(1, pt.minHoldingDays / 30);
     const desired = clamp(need, cr.minAmount, maxAmt);
-    // rational depositor: parks only what is needed to earn the desired loan within ~3 months
-    const required = (desired * tenor) / (Math.max(0.1, pt.coefficient) * Math.max(minHold, 3));
-    deposit = Math.min(avail, required);
-    holdMonths = deposit > 0.5 ? (desired * tenor) / (Math.max(0.1, pt.coefficient) * deposit) : 99;
-    holdMonths = clamp(holdMonths, minHold, 12);
-    pointsCap = (pt.coefficient * deposit * holdMonths) / tenor;
+    if (tier) {
+      // tiered murabaha: loan = α × average balance after the tier's waiting period
+      const alpha = Math.max(0.01, tier.loanToAvgDepositPct / 100);
+      deposit = Math.min(avail, desired / alpha);
+      holdMonths = Math.max(1, tier.waitingMonths);
+      pointsCap = deposit >= tier.minAvgDeposit ? alpha * deposit : 0;
+    } else {
+      const minHold = Math.max(1, pt.minHoldingDays / 30);
+      // rational depositor: parks only what is needed to earn the desired loan within ~3 months
+      const required = (desired * tenor) / (Math.max(0.1, pt.coefficient) * Math.max(minHold, 3));
+      deposit = Math.min(avail, required);
+      holdMonths = deposit > 0.5 ? (desired * tenor) / (Math.max(0.1, pt.coefficient) * deposit) : 99;
+      holdMonths = clamp(holdMonths, minHold, 12);
+      pointsCap = (pt.coefficient * deposit * holdMonths) / tenor;
+    }
     waitDays = Math.round(holdMonths * 30);
     patienceF = holdMonths > c.patience ? 0.3 : 1;
   }
+  const holdDays = tier ? tier.waitingMonths * 30 : pt.minHoldingDays;
   const pointsAttract = isPoints
-    ? Math.pow(Math.max(0.2, pt.coefficient) / 2, 0.6) *
+    ? (tier ? 1.1 : Math.pow(Math.max(0.2, pt.coefficient) / 2, 0.6)) *
       (pt.transferable ? 1.15 : 1) *
       (pt.expiryMonths > 0 ? 0.9 : 1) *
-      clamp(1 - 0.0015 * (pt.minHoldingDays - 30), 0.6, 1.1) *
+      clamp(1 - 0.0015 * (holdDays - 30), 0.6, 1.1) *
       (c.balance >= 5 ? 1 : 0.15) *
       (1 + 0.01 * pt.depositRate) *
       patienceF
@@ -222,9 +259,9 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
     ? 1
     : clamp(
         (1 - 0.015 * cr.compensatingDeposit) *
-          (1 + 0.02 * Math.min(cr.grace, 12)) *
+          (1 + 0.02 * Math.min(grace, 12)) *
           (1 + 0.004 * clamp(tenor - 12, -12, 48)) *
-          (1 - 0.006 * cr.downPayment) *
+          (1 - 0.006 * downPct) *
           (1 - 0.03 * cr.upfrontFee) *
           (k === "credit_card" ? 1 + 0.004 * cr.interestFreeDays : 1),
         0.2,
@@ -241,7 +278,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
     checks.push({ ok: true, label: "عضویت در باشگاه", detail: "عضویت برای همه دارندگان حساب و کارت آزاد است" });
     return {
       applyProb, eligible: true, checks, drivers, score, need, amount: 0, financed: 0, limit: 0, drawn: 0, installment: 0,
-      dti: (c.existingDebt / Math.max(0.5, c.income)) * 100, pd: 0, lgd: 0, tenor, rate, deposit, holdMonths, waitDays, reducedByDti: false,
+      dti: (c.existingDebt / Math.max(0.5, c.income)) * 100, pd: 0, lgd: 0, tenor, rate, deposit, holdMonths, waitDays, reducedByDti: false, tierIndex,
     };
   }
 
@@ -257,7 +294,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   else fail("امتیاز اعتباری", `امتیاز ${fa(score)} کمتر از حد نصاب ${fa(rk.minScore)} است`);
 
   // 2) age at maturity
-  const ageEnd = c.age + (tenor + cr.grace + (isPoints ? holdMonths : 0)) / 12;
+  const ageEnd = c.age + (tenor + grace + (isPoints ? holdMonths : 0)) / 12;
   if (ageEnd <= rk.maxAge) pass("سن در پایان قرارداد", `${fa(ageEnd, 1)} سال (سقف ${fa(rk.maxAge)})`);
   else fail("سن در پایان قرارداد", `${fa(ageEnd, 1)} سال؛ بیش از سقف ${fa(rk.maxAge)} سال`);
 
@@ -319,8 +356,8 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
       financed = drawn;
       inst = drawn * (rate / 1200 + 1 / tenor);
     } else {
-      financed = amount * (1 - cr.downPayment / 100);
-      inst = buildSchedule(financed, rate, tenor, cr.grace, isPoints ? "annuity" : cr.repayment, cr.stepUp, cr.balloon).installment;
+      financed = amount * (1 - downPct / 100);
+      inst = buildSchedule(financed, rate, tenor, grace, isPoints ? "annuity" : cr.repayment, cr.stepUp, cr.balloon).installment;
     }
   };
   compute();
@@ -364,6 +401,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   z += add("طول دوره بازپرداخت", 0.004 * (tenor - 24));
   if (rk.behavioral) z += add("پایش رفتاری و هشدار زودهنگام", -0.15);
   if (hybrid) z += add("پاداش خوش‌حسابی (لایه امتیاز)", -0.12);
+  if (tier) z += add("خودانتخابی مشتری صبور (انتظار طولانی‌تر)", -0.03 * Math.max(0, tier.waitingMonths - 2));
   z += add("شرایط کلان اقتصادی", Math.log(ctx.scenario.pdMultiplier));
   const pd = clamp(sigmoid(z), 0.002, 0.6);
 
@@ -377,7 +415,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
 
   return {
     applyProb, eligible, checks, drivers, score, need, amount, financed, limit, drawn, installment: inst, dti, pd, lgd,
-    tenor, rate, deposit, holdMonths, waitDays, reducedByDti,
+    tenor, rate, deposit, holdMonths, waitDays, reducedByDti, tierIndex,
   };
 }
 
@@ -445,6 +483,9 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
   const ramp = Math.max(3, Math.round(H * 0.6));
   const tenor = Math.max(1, Math.round(cr.tenor));
   const nplWin = isRev ? 12 : clamp(tenor, 4, 12);
+  const upfrontPct = isPoints ? pointsUpfrontFee(cfg) : cr.upfrontFee;
+  let rateVol = 0;
+  let rateW = 0;
 
   const nb = SCORE_BANDS.length;
   const bApplied = zeros(nb);
@@ -512,12 +553,18 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
     if (c.thinFile || qi <= 1) incl++;
     const takes = isPoints ? c.u[4] < pt.usageRate / 100 : true;
     if (isPoints) {
-      depMT += uw.deposit * uw.holdMonths + (takes ? 0.45 * uw.deposit * tenor : uw.deposit * 12);
-      if (takes) loanMT += (uw.financed * (tenor + 1)) / 2;
+      // mirrors the balance behaviour of the cash-flow loop below (tiered: 15% kept after the loan, 40% leave after waiting)
+      const tieredDep = uw.tierIndex >= 0;
+      depMT += uw.deposit * uw.holdMonths + (takes ? (tieredDep ? 0.15 : 0.45) * uw.deposit * uw.tenor : uw.deposit * 12 * (tieredDep ? 0.6 : 1));
+      if (takes) loanMT += (uw.financed * (uw.tenor + 1)) / 2;
+    }
+    if (takes && !isLoyalty) {
+      rateVol += uw.rate * uw.financed;
+      rateW += uw.financed;
     }
     let sch: Schedule | undefined;
     if (!isLoyalty && !isRev && takes) {
-      sch = buildSchedule(uw.financed, uw.rate, tenor, isPoints ? 0 : cr.grace, isPoints ? "annuity" : cr.repayment, cr.stepUp, cr.balloon);
+      sch = buildSchedule(uw.financed, uw.rate, uw.tenor, isPoints ? 0 : cr.grace, isPoints ? "annuity" : cr.repayment, cr.stepUp, cr.balloon);
       const exposure = uw.financed * 0.55;
       const type = cfg.purpose === "housing" && rk.collateral === "property" ? "mortgage" : "other";
       ecS += irbRetailK(uw.pd, uw.lgd, type) * exposure;
@@ -546,7 +593,8 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
   const opexPer = (fnd.opexPerAccount / 1000) * ch.opex;
   const cac = (fnd.acquisitionCost / 1000) * ch.cac;
   const collCost = (0.02 * rk.collectionsIntensity) / 100;
-  const prodRate = isPoints ? pt.loanFee : cr.rate;
+  // points products: volume-weighted contract rate of the booked loans (tiers can differ)
+  const prodRate = isPoints ? (rateW > 0 ? rateVol / rateW : isTieredPoints(cfg) ? aprFor(cfg) : pointsLoanRate(cfg)) : cr.rate;
   const cpr = clamp(0.1 - 0.002 * (ctx.inflation - prodRate), 0.01, 0.15) * (1 + cr.prepayDiscount / 200);
   const prepayM = cpr / 12;
   const uplift = (ly.spendUplift / 100) * (ly.tiers ? 1.25 : 1) * (ly.gamification ? 1.2 : 1);
@@ -589,7 +637,7 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
     };
     const simLoan = (b: Booking, startM: number, sch: Schedule, rateA: number, hBase: number, lgd: number, extraFee: number, lateP: number) => {
       const principal = b.uw.financed;
-      fee[startM] += (principal * (isPoints ? 0 : cr.upfrontFee)) / 100 + extraFee;
+      fee[startM] += (principal * upfrontPct) / 100 + extraFee;
       opex[startM] += cac;
       booked++;
       vol += principal;
@@ -653,14 +701,20 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
         const loanStart = b.start + hold;
         const rejected = !b.uw.eligible;
         opex[b.start] += cac * 0.6;
+        // tiered (average-balance) schemes: the deposit is only a condition for the loan → same behaviour as the
+        // ALM lab: 85% run-off after disbursement, 40% of the other savers leave when their wait ends
+        const tieredMode = b.uw.tierIndex >= 0;
+        const keepAfterLoan = tieredMode ? 0.15 : 0.45;
+        const leavesAtEnd = tieredMode && !loanOk && rng() < 0.4;
         for (let m = b.start; m <= H; m++) {
+          if (leavesAtEnd && m >= loanStart) break;
           if (m >= b.start + hold && rng() < (rejected ? 0.08 : 0.015)) break;
-          const d = loanOk && m >= loanStart ? D * 0.45 : rejected && m >= loanStart ? D * 0.5 : D;
+          const d = loanOk && m >= loanStart ? D * keepAfterLoan : rejected && m >= loanStart ? D * 0.5 : D;
           dep[m] += d;
           ben[m] += d * benefitRate;
           opex[m] += opexPer * 0.35;
         }
-        if (loanOk && b.sch && loanStart <= H) simLoan(b, loanStart, b.sch, pt.loanFee, hBase, lgd, 0, lateP);
+        if (loanOk && b.sch && loanStart <= H) simLoan(b, loanStart, b.sch, b.uw.rate, hBase, lgd, 0, lateP);
         continue;
       }
 
@@ -800,6 +854,8 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
   const last = series[series.length - 1];
 
   const pct = (v: number) => (isLoyalty || avgOut <= 1e-6 ? 0 : ((v * annual) / safeOut) * 100);
+  // Hurdle is an after-tax ROE; pricing components are pre-tax → gross up by 1/(1 − tax).
+  const grossRoe = fnd.targetRoe / Math.max(0.05, 1 - fnd.taxRate / 100);
   const pricing: PricingBreakdown = {
     cof: pct(fundingCost),
     el: pct(lossesT),
@@ -807,11 +863,11 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
     fees: pct(feeIncome),
     benefit: pct(benefitT),
     reward: pct(rewardT),
-    capital: isLoyalty || avgOut <= 1e-6 ? 0 : ((capital * fnd.targetRoe) / 100 / safeOut) * 100,
+    capital: isLoyalty || avgOut <= 1e-6 ? 0 : ((capital * grossRoe) / 100 / safeOut) * 100,
     breakEven: 0,
     riskBased: 0,
     productRate: prodRate,
-    cap: cfg.contract === "qard" || isPoints ? CBI.qardFeeCap : CBI.loanRateCap,
+    cap: cfg.contract === "qard" ? CBI.qardFeeCap : CBI.loanRateCap,
   };
   pricing.breakEven = pricing.cof + pricing.el + pricing.opex + pricing.reward - pricing.fees - pricing.benefit;
   pricing.riskBased = pricing.breakEven + pricing.capital;
@@ -823,7 +879,7 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
       const bpd = bPd[i] / bApproved[i];
       const blgd = bLgd[i] / bApproved[i];
       const el = bpd * blgd * 100;
-      const capCharge = irbRetailK(bpd, blgd, isRev ? "qrre" : "other") * fnd.targetRoe;
+      const capCharge = irbRetailK(bpd, blgd, isRev ? "qrre" : "other") * grossRoe;
       const required = pricing.cof + el + pricing.opex - pricing.fees - pricing.benefit + pricing.reward + capCharge;
       pricingGrid.push({
         band: SCORE_BANDS[i].label,
@@ -960,10 +1016,12 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
   };
 }
 
-export function repaymentPreview(cfg: ProductConfig, amount: number) {
+export function repaymentPreview(cfg: ProductConfig, amount: number, tierIndex = -1) {
   const isPoints = cfg.kind === "points_loan";
-  const rate = isPoints ? cfg.points.loanFee : cfg.credit.rate;
+  const tier = isTieredPoints(cfg) ? cfg.points.tiers[tierIndex >= 0 ? tierIndex : 0] : undefined;
+  const rate = tier ? tier.rate : isPoints ? pointsLoanRate(cfg) : cfg.credit.rate;
+  const tenor = tier ? tier.repaymentMonths : cfg.credit.tenor;
   const financed = amount * (1 - (isPoints ? 0 : cfg.credit.downPayment) / 100);
   const method: Repayment = isPoints ? "annuity" : cfg.credit.repayment;
-  return buildSchedule(financed, rate, cfg.credit.tenor, isPoints ? 0 : cfg.credit.grace, method, cfg.credit.stepUp, cfg.credit.balloon);
+  return buildSchedule(financed, rate, tenor, isPoints ? 0 : cfg.credit.grace, method, cfg.credit.stepUp, cfg.credit.balloon);
 }
