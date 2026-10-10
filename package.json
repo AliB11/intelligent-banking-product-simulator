@@ -36,7 +36,7 @@
     "postcss": "^8.5.29",
     "tailwindcss": "4.1.17",
     "tsx": "^4.23.15",
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
   },
   "engines": {
     "node": ">=20.9.0"
