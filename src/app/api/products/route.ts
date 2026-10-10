@@ -21,7 +21,7 @@ export async function POST(req: Request) {
     const cfg = normalizeConfig(body.config);
     const full = analyzeResult(cfg, simulatePortfolio(cfg, QUICK_PARAMS));
     const row = await createProduct(cfg, full.health.score);
-    return Response.json({ id: row.id }, { status: 201 });
+    return Response.json({ id: row.id, config: row.config, configVersion: row.configVersion }, { status: 201 });
   } catch (e) {
     return apiFailure(e);
   }

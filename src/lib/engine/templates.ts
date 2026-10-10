@@ -158,7 +158,7 @@ export function mergeConfig(base: ProductConfig, patch: DeepPartial<ProductConfi
 /** Whitelist structure and bound computational inputs; regulatory violations remain visible to the advisor. */
 export function normalizeConfig(input: unknown): ProductConfig {
   const defaults = defaultConfig();
-  const enums: Record<string, object> = { family: FAMILIES, kind: KINDS, contract: CONTRACTS, purpose: PURPOSES, segment: SEGMENTS, channel: CHANNELS, repayment: REPAYMENTS, collateral: COLLATERALS };
+  const enums: Record<string, object> = { family: FAMILIES, kind: KINDS, contract: CONTRACTS, purpose: PURPOSES, segment: SEGMENTS, channel: CHANNELS, repayment: REPAYMENTS, collateral: COLLATERALS, mode: { simple: true, tiered_murabaha: true } };
   const limits: Record<string, [number, number]> = {
     tenor: [1, 360], grace: [0, 60], minAmount: [1, 1e6], maxAmount: [1, 1e6], maxLoan: [1, 1e6],
     minScore: [0, 900], maxAge: [18, 100], guarantors: [0, 10], coverage: [0, 1000],
@@ -187,7 +187,12 @@ export function normalizeConfig(input: unknown): ProductConfig {
     // the only array in the schema is points.tiers: every element is whitelisted and bounded
     if (Array.isArray(base)) {
       if (!Array.isArray(raw)) return base;
-      return raw.slice(0, MAX_TIERS).map(sanitizeTier).filter((t): t is TieredMurabahaTier => t !== null);
+      const seen = new Set<string>();
+      return raw.slice(0, MAX_TIERS).map(sanitizeTier).filter((t): t is TieredMurabahaTier => t !== null).map((tier) => {
+        if (tier.id && seen.has(tier.id)) delete tier.id;
+        if (tier.id) seen.add(tier.id);
+        return tier;
+      });
     }
     const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
     return Object.fromEntries(Object.entries(base).map(([key, fallback]) => {

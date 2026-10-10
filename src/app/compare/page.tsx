@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { bannerColor, foregroundOn } from "@/lib/color";
 import { BarsChart, DnaRadar } from "@/components/charts";
 import { Card, Select, Spinner } from "@/components/ui";
 import { analyzeResult } from "@/lib/engine/advisor";
@@ -17,7 +18,7 @@ interface Item {
   healthScore: number | null;
 }
 
-type Row = { label: string; get: (r: FullResult) => number; fmt: (v: number) => string; better: "high" | "low" };
+type Row = { label: string; get: (r: FullResult) => number | null; fmt: (v: number) => string; better: "high" | "low" };
 
 const ROWS: Row[] = [
   { label: "امتیاز سلامت", get: (r) => r.health.score, fmt: (v) => fmt(v), better: "high" },
@@ -37,7 +38,9 @@ export default function ComparePage() {
   const [sel, setSel] = useState<number[]>([]);
   const [scenario, setScenario] = useState<ScenarioId>("base");
   const [results, setResults] = useState<Record<number, FullResult>>({});
-  const [running, setRunning] = useState(false);
+  const [resultKey, setResultKey] = useState("");
+  const workKey = JSON.stringify([scenario, sel.map((id) => [id, items.find((it) => it.id === id)?.config])]);
+  const running = items.length > 0 && sel.length > 0 && resultKey !== workKey;
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -55,28 +58,25 @@ export default function ComparePage() {
 
   useEffect(() => {
     if (!items.length || !sel.length) return;
-    let workTimer: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
-      setRunning(true);
-      workTimer = setTimeout(() => {
+      try {
         const out: Record<number, FullResult> = {};
         for (const id of sel) {
           const it = items.find((i) => i.id === id);
-          if (!it) continue;
-          out[id] = analyzeResult(it.config, simulatePortfolio(it.config, { ...QUICK_PARAMS, customers: 2000, runs: 6, scenario, scale: 500 }));
+          if (it) out[id] = analyzeResult(it.config, simulatePortfolio(it.config, { ...QUICK_PARAMS, customers: 2000, runs: 6, scenario, scale: 500 }));
         }
         setResults(out);
-        setRunning(false);
-      }, 0);
+        setError(null);
+      } catch {
+        setResults({});
+        setError("محاسبه مقایسه انجام نشد؛ دوباره تلاش کنید.");
+      } finally { setResultKey(workKey); }
     }, 0);
-    return () => {
-      clearTimeout(timer);
-      if (workTimer) clearTimeout(workTimer);
-    };
-  }, [items, sel, scenario]);
+    return () => clearTimeout(timer);
+  }, [items, sel, scenario, workKey]);
 
   const toggle = (id: number) => setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : s.length >= 4 ? s : [...s, id]));
-  const chosen = sel.map((id) => items.find((i) => i.id === id)).filter((x): x is Item => !!x && !!results[x.id]);
+  const chosen = sel.map((id) => items.find((i) => i.id === id)).filter((x): x is Item => !!x && resultKey === workKey && !!results[x.id]);
 
   return (
     <div className="space-y-5">
@@ -102,16 +102,21 @@ export default function ComparePage() {
               key={it.id}
               type="button"
               onClick={() => toggle(it.id)}
+              aria-pressed={sel.includes(it.id)}
+              disabled={!sel.includes(it.id) && sel.length >= 4}
               className={`rounded-xl border px-3 py-2 text-sm transition ${sel.includes(it.id) ? "border-transparent text-white shadow" : "border-slate-200 bg-white text-slate-700 hover:border-indigo-300"}`}
-              style={sel.includes(it.id) ? { background: it.config.color } : undefined}
+              style={sel.includes(it.id) ? { background: it.config.color, color: foregroundOn(it.config.color) } : undefined}
             >
               {it.config.emoji} {it.name}
-              <span className="mr-1 text-[10px] opacity-80">({KINDS[it.config.kind].label})</span>
+              <span className="mr-1 text-[10px]">({KINDS[it.config.kind].label})</span>
             </button>
           ))}
         </div>
       </Card>
 
+      {loaded && !error && items.length > 0 && sel.length === 0 && (
+        <Card><p className="py-6 text-center text-sm text-slate-600">یک یا چند محصول را از بالا انتخاب کنید.</p></Card>
+      )}
       {chosen.length > 0 && (
         <>
           <div className="grid gap-4 lg:grid-cols-2">
@@ -134,7 +139,7 @@ export default function ComparePage() {
             </Card>
           </div>
           <Card title="جدول شاخص‌ها" icon="📋" subtitle="خانه سبز = بهترین در هر شاخص">
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="جدول شاخص‌های مقایسه محصولات">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b">
@@ -142,7 +147,7 @@ export default function ComparePage() {
                     {chosen.map((c) => (
                       <th key={c.id} className="p-2 text-center">
                         <span className="text-lg">{c.config.emoji}</span>
-                        <div className="text-xs font-bold" style={{ color: c.config.color }}>{c.name}</div>
+                        <div className="text-xs font-bold" style={{ color: bannerColor(c.config.color) }}>{c.name}</div>
                       </th>
                     ))}
                   </tr>
@@ -150,13 +155,14 @@ export default function ComparePage() {
                 <tbody>
                   {ROWS.map((row) => {
                     const vals = chosen.map((c) => row.get(results[c.id]));
-                    const best = row.better === "high" ? Math.max(...vals) : Math.min(...vals);
+                    const numeric = vals.filter((v): v is number => v !== null);
+                    const best = numeric.length ? (row.better === "high" ? Math.max(...numeric) : Math.min(...numeric)) : null;
                     return (
                       <tr key={row.label} className="border-b border-slate-50">
                         <td className="p-2 text-slate-600">{row.label}</td>
                         {vals.map((v, i) => (
-                          <td key={chosen[i].id} className={`p-2 text-center font-semibold ${v === best && chosen.length > 1 ? "rounded-lg bg-emerald-50 text-emerald-700" : ""}`}>
-                            {row.fmt(v)}
+                          <td key={chosen[i].id} className={`p-2 text-center font-semibold ${v !== null && v === best && chosen.length > 1 ? "rounded-lg bg-emerald-50 text-emerald-700" : ""}`}>
+                            {v === null ? "—" : row.fmt(v)}
                           </td>
                         ))}
                       </tr>

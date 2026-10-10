@@ -23,7 +23,8 @@ export default async function Home() {
     dbError = "ارتباط با پایگاه داده برقرار نشد. طراحی و سفر مشتری در دسترس است؛ ذخیره‌سازی به اتصال پایگاه داده نیاز دارد.";
   }
   const simulated = items.filter((i) => i.latest).length;
-  const avgHealth = items.length ? items.reduce((s, i) => s + (i.healthScore ?? 0), 0) / items.length : 0;
+  const rated = items.filter((i) => i.healthScore !== null);
+  const avgHealth = rated.length ? rated.reduce((s, i) => s + i.healthScore!, 0) / rated.length : null;
 
   const macro = [
     { label: "سقف نرخ سود تسهیلات", value: `${fmt(CBI.loanRateCap)}٪`, icon: "🏛️" },
@@ -34,8 +35,8 @@ export default async function Home() {
     { label: "نرخ سود واقعی", value: "منفی", icon: "📉" },
   ];
   const pipeline = [
-    { icon: "🧬", title: "طراحی", text: "۱۵ الگوی مبتنی بر بازار ایران یا ایده خلاقانه تصادفی" },
-    { icon: "👥", title: "جمعیت مصنوعی", text: "هزاران مشتری با درآمد، اشتغال، رتبه ۰ تا ۹۰۰ و رفتار واقعی" },
+    { icon: "🧬", title: "طراحی", text: `${fmt(TEMPLATES.length)} الگوی مبتنی بر بازار ایران یا ایده خلاقانه تصادفی` },
+    { icon: "👥", title: "جمعیت مصنوعی", text: "هزاران مشتری با درآمد، اشتغال، رتبه ۰ تا ۹۰۰ و رفتار فرضی" },
     { icon: "🧾", title: "اعتبارسنجی", text: "قواعد DTI، وثیقه، سن و PD قابل‌توضیح" },
     { icon: "🎲", title: "مونت‌کارلو", text: "شوک سیستماتیک واسیچک، فصلی‌شدن نکول و انتشار باس" },
     { icon: "🤖", title: "دستیار هوشمند", text: "سیستم خبره، قیمت‌گذاری ریسک‌محور و انطباق" },
@@ -82,7 +83,7 @@ export default async function Home() {
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
         {pipeline.map((p, i) => (
           <div key={p.title} className="relative rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="absolute left-3 top-3 text-xs font-black text-slate-200">{fmt(i + 1)}</div>
+            <div className="absolute left-3 top-3 text-xs font-black text-slate-500">{fmt(i + 1)}</div>
             <div className="text-2xl">{p.icon}</div>
             <div className="mt-1 font-bold text-slate-800">{p.title}</div>
             <div className="mt-1 text-xs leading-5 text-slate-500">{p.text}</div>
@@ -129,7 +130,7 @@ export default async function Home() {
                     <>
                       <div className="rounded-lg bg-slate-50 p-2">
                         <div className="text-slate-400">سود خالص</div>
-                        <div className={`font-bold ${(s.netProfit ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{money(s.netProfit ?? 0)}</div>
+                        <div className={`font-bold ${(s.netProfit ?? 0) >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{money(s.netProfit)}</div>
                       </div>
                       <div className="rounded-lg bg-slate-50 p-2">
                         <div className="text-slate-400">{isLoyalty ? "ROI" : "RAROC"}</div>
@@ -141,7 +142,7 @@ export default async function Home() {
                       </div>
                     </>
                   ) : (
-                    <div className="col-span-3 rounded-lg bg-amber-50 p-2 text-amber-700">هنوز شبیه‌سازی کامل اجرا نشده — امتیاز از پیش‌نمایش سریع</div>
+                    <div className="col-span-3 rounded-lg bg-amber-50 p-2 text-amber-700">{p.healthScore === null ? "نتیجه معتبر برای نسخه فعلی موتور موجود نیست؛ دوباره شبیه‌سازی کنید." : "هنوز شبیه‌سازی کامل اجرا نشده — امتیاز از پیش‌نمایش سریع"}</div>
                   )}
                 </div>
                 <div className="flex border-t border-slate-100 text-sm">

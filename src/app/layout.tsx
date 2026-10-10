@@ -13,7 +13,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="fa" dir="rtl">
+    <html lang="fa" dir="rtl" data-scroll-behavior="smooth">
       <body className="min-h-screen text-slate-900 antialiased">
         <a href="#main-content" className="skip-link">رفتن به محتوای اصلی</a>
         <header className="sticky top-0 z-40 border-b border-white/10 bg-slate-950/90 text-white backdrop-blur">

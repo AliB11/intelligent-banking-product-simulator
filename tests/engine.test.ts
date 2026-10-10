@@ -50,14 +50,17 @@ test("sample reduction preserves market size at every analysis cap", () => {
   assert.equal(sanitizeParams({ scenario: "__proto__" }).scenario, "base");
   assert.equal(sanitizeParams({ scenario: "constructor" }).scenario, "base");
 });
-test("seeded simulations are deterministic and all template KPIs are finite", () => {
+test("seeded simulations are deterministic and template KPIs are finite or explicitly undefined", () => {
   const p = { ...QUICK_PARAMS, customers: 100, runs: 2, horizon: 12, scale: 10000 };
   assert.deepEqual(simulatePortfolio(defaultConfig(), p).kpis, simulatePortfolio(defaultConfig(), p).kpis);
   for (const t of TEMPLATES) {
     const cfg = templateConfig(t.key)!;
     assert.deepEqual(normalizeConfig(cfg), cfg, t.key);
     const sim = simulatePortfolio(cfg, p);
-    for (const [key, value] of Object.entries(sim.kpis)) assert.ok(Number.isFinite(value), `${t.key}/${key}`);
+    for (const [key, value] of Object.entries(sim.kpis)) {
+      const undefinedRatio = ["roa", "nim", "raroc", "rarocCredit", "rarocLiquidity"].includes(key) && value === null;
+      assert.ok(undefinedRatio || Number.isFinite(value), `${t.key}/${key}`);
+    }
     assert.equal(sim.series.length, p.horizon);
   }
   const a = mulberry32(42), b = mulberry32(42);
@@ -69,7 +72,7 @@ test("stress scenarios retain a common market and produce finite results", () =>
   assert.ok(rows.every(r => Number.isFinite(r.netProfit)));
 });
 test("API rejects malformed, absent, oversized payloads and invalid identifiers", async () => {
-  const req = (body: string) => new Request("http://test/api", { method: "POST", body });
+  const req = (body: string) => new Request("http://test/api", { method: "POST", headers: { "Content-Type": "application/json" }, body });
   for (const body of ["{", "null", "[]", "{}", '{"config":false}', '{"productId":0}']) await assert.rejects(readBody(req(body)));
   await assert.rejects(readBody(req(JSON.stringify({config: {}, extra: "a".repeat(66000)}))), /حجم/);
   assert.deepEqual(await readBody(req('{"config":{}}')), {config: {}});

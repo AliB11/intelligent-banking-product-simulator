@@ -13,7 +13,7 @@ export default function Launchpad() {
       <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-500">طراحی ← آزمایش ← تصمیم</span>
     </div>
     <div className="grid gap-3 md:grid-cols-3">{tasks.map(t => <Link href={t.href} key={t.href} className="group rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:-translate-y-1 hover:border-teal-300 hover:shadow-lg">
-      <div className="mb-5 flex items-center justify-between"><span className={`rounded-lg px-2.5 py-1 text-xs font-semibold ${t.color}`}>{t.tag}</span><span className="font-mono text-xl text-slate-300">{t.number}</span></div>
+      <div className="mb-5 flex items-center justify-between"><span className={`rounded-lg px-2.5 py-1 text-xs font-semibold ${t.color}`}>{t.tag}</span><span aria-hidden="true" className="font-mono text-xl text-slate-500">{t.number}</span></div>
       <h3 className="font-bold text-slate-900">{t.title}</h3><p className="mt-2 text-sm leading-6 text-slate-500">{t.text}</p>
       <span className="mt-4 block text-sm font-bold text-teal-700">شروع مسیر <span aria-hidden="true">←</span></span>
     </Link>)}</div>

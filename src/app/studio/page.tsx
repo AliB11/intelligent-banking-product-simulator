@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { fmt } from "@/lib/format";
 import RandomIdeaButton from "@/components/RandomIdeaButton";
 import Studio from "@/components/Studio";
 import { FAMILIES } from "@/lib/engine/catalog";
@@ -28,7 +29,7 @@ export default async function StudioPage({ searchParams }: { searchParams: Promi
           <div>
             <h1 className="text-2xl font-black">🧪 کارگاه طراحی محصول</h1>
             <p className="mt-1 max-w-2xl text-sm text-slate-300">
-              از یکی از ۱۵ الگوی مبتنی بر تحقیق بازار ایران شروع کنید، از صفر بسازید، یا بگذارید موتور ایده‌پرداز سیمرغ یک محصول خلاقانه بسازد.
+              از یکی از {fmt(TEMPLATES.length)} الگوی مبتنی بر تحقیق بازار ایران شروع کنید، از صفر بسازید، یا بگذارید موتور ایده‌پرداز سیمرغ یک محصول خلاقانه بسازد.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">

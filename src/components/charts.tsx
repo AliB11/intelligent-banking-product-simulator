@@ -23,6 +23,7 @@ import {
   YAxis,
   ZAxis,
 } from "recharts";
+import { foregroundOn } from "@/lib/color";
 import { axisMoney, count, fmt, money, pct } from "@/lib/format";
 
 const tooltipStyle = { direction: "rtl" as const, fontFamily: "inherit", fontSize: 12, borderRadius: 12 };
@@ -237,7 +238,7 @@ export function Tornado({
     const style = d >= 0 ? { left: "50%", width: `${w}%` } : { left: `${50 - w}%`, width: `${w}%` };
     return (
       <div className="absolute top-1 flex h-5 items-center rounded" style={{ ...style, background: color }} title={text}>
-        <span className="whitespace-nowrap px-1 text-[10px] font-bold text-white drop-shadow">{w > 12 ? text : ""}</span>
+        <span className="whitespace-nowrap px-1 text-[10px] font-bold" style={{ color: foregroundOn(color) }}>{w > 12 ? text : ""}</span>
       </div>
     );
   };

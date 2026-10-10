@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { customerAllInCost, pmtFor } from "@/lib/engine/alm";
+import { NumericInput } from "@/components/ui";
 import { CBI } from "@/lib/engine/catalog";
 import { effectiveApr, tierWeights } from "@/lib/engine/math";
 import { MAX_TIERS } from "@/lib/engine/templates";
@@ -11,8 +12,8 @@ import { fmt } from "@/lib/format";
 type NumKey = "waitingMonths" | "repaymentMonths" | "loanToAvgDepositPct" | "rate" | "minAvgDeposit" | "expectedTakeUpShare";
 
 const COLS: { key: NumKey; label: string; unit: string; min: number; max: number; step: number }[] = [
-  { key: "waitingMonths", label: "انتظار", unit: "ماه", min: 1, max: 60, step: 1 },
-  { key: "loanToAvgDepositPct", label: "ضریب α", unit: "٪ معدل", min: 5, max: 1000, step: 5 },
+  { key: "waitingMonths", label: "انتظار", unit: "ماه", min: 0, max: 60, step: 1 },
+  { key: "loanToAvgDepositPct", label: "ضریب α", unit: "٪ معدل", min: 0, max: 1000, step: 5 },
   { key: "rate", label: "نرخ سود", unit: "٪", min: 0, max: 40, step: 0.5 },
   { key: "repaymentMonths", label: "بازپرداخت", unit: "ماه", min: 1, max: 360, step: 1 },
   { key: "minAvgDeposit", label: "حداقل معدل", unit: "م.ت", min: 0, max: 10000, step: 1 },
@@ -29,6 +30,9 @@ export default function TierTable({
   insurance,
   contract,
   depositRate,
+  loanCap = Infinity,
+  minLoan = 0,
+  minDeposit = 0,
   onChange,
 }: {
   tiers: TieredMurabahaTier[];
@@ -36,21 +40,27 @@ export default function TierTable({
   insurance: number;
   contract: "qard" | "murabaha";
   depositRate: number;
+  loanCap?: number;
+  minLoan?: number;
+  minDeposit?: number;
   onChange: (tiers: TieredMurabahaTier[]) => void;
 }) {
   const [oppRate, setOppRate] = useState(23);
   /** all-in annual cost for a customer with a 100M toman average balance (IRR incl. the opportunity cost of waiting) */
+  const loanFor = (t: TieredMurabahaTier) => {
+    const loan = Math.min(t.loanToAvgDepositPct, loanCap);
+    return 100 >= Math.max(minDeposit, t.minAvgDeposit) && loan >= minLoan ? loan : 0;
+  };
   const allIn = (t: TieredMurabahaTier) => {
-    const loan = t.loanToAvgDepositPct; // α% of 100M = α million
+    const loan = loanFor(t); // α% of 100M = α million
     const n = Math.max(1, Math.round(t.repaymentMonths));
     if (loan <= 0) return null;
-    return customerAllInCost(loan, 100, t.waitingMonths, pmtFor(contract, loan, t.rate, n), n, oppRate, depositRate).cost;
+    return customerAllInCost(loan, 100, t.waitingMonths, pmtFor(contract, loan, t.rate, n), n, oppRate, depositRate, upfrontFee, insurance).cost;
   };
   const weights = tierWeights(tiers);
   const shareSum = tiers.reduce((s, t) => s + t.expectedTakeUpShare, 0);
-  const set = (i: number, key: NumKey, raw: string) => {
-    const v = Number(raw);
-    if (!Number.isFinite(v)) return;
+  const set = (i: number, key: NumKey, value: number) => {
+    const v = key === "waitingMonths" || key === "repaymentMonths" ? Math.round(value) : value;
     onChange(tiers.map((t, j) => (j === i ? { ...t, [key]: v } : t)));
   };
   const add = () => {
@@ -82,9 +92,10 @@ export default function TierTable({
           </thead>
           <tbody>
             {tiers.map((t, i) => {
-              const apr = effectiveApr(100, t.rate, Math.max(1, Math.round(t.repaymentMonths)), 0, "annuity", 0, 0, upfrontFee, insurance, 0);
+              const loan = loanFor(t);
+              const apr = loan > 0 ? effectiveApr(loan, t.rate, Math.max(1, Math.round(t.repaymentMonths)), 0, "annuity", 0, 0, upfrontFee, insurance, 0) : null;
               return (
-                <tr key={t.id ?? i} className="border-t border-slate-100">
+                <tr key={t.id ? `id:${t.id}` : `index:${i}`} className="border-t border-slate-100">
                   <td className="p-1.5">
                     <input
                       aria-label="نام پله"
@@ -96,19 +107,18 @@ export default function TierTable({
                   </td>
                   {COLS.map((c) => (
                     <td key={c.key} className="p-1.5">
-                      <input
+                      <NumericInput
                         aria-label={`${c.label} ${t.name}`}
-                        type="number"
                         className={`w-20 rounded border px-1.5 py-1 tabular-nums ${c.key === "rate" && t.rate > CBI.loanRateCap ? "border-rose-400 bg-rose-50" : "border-slate-200"}`}
                         value={t[c.key]}
                         min={c.min}
                         max={c.max}
                         step={c.step}
-                        onChange={(e) => set(i, c.key, e.target.value)}
+                        onChange={(v) => set(i, c.key, v)}
                       />
                     </td>
                   ))}
-                  <td className="p-1.5 tabular-nums text-slate-700">{fmt(apr, 1)}٪</td>
+                  <td className="p-1.5 tabular-nums text-slate-700">{apr === null ? "—" : `${fmt(apr, 1)}٪`}</td>
                   {(() => {
                     const c = allIn(t);
                     return (
@@ -117,7 +127,7 @@ export default function TierTable({
                       </td>
                     );
                   })()}
-                  <td className="p-1.5 tabular-nums text-slate-700">{fmt(t.loanToAvgDepositPct, 0)} م.ت</td>
+                  <td className="p-1.5 tabular-nums text-slate-700">{fmt(loanFor(t), 0)} م.ت</td>
                   <td className="p-1.5 text-left">
                     <button type="button" className="rounded px-1.5 py-0.5 text-rose-600 hover:bg-rose-50 disabled:opacity-30" onClick={() => remove(i)} disabled={tiers.length <= 1} aria-label={`حذف ${t.name}`}>
                       ✕
@@ -137,7 +147,7 @@ export default function TierTable({
         </span>
         <label className="flex items-center gap-1">
           نرخ فرصت مشتری
-          <input aria-label="نرخ فرصت مشتری" type="number" className="w-16 rounded border border-slate-200 px-1.5 py-0.5 tabular-nums" value={oppRate} min={0} max={60} step={0.5} onChange={(e) => Number.isFinite(Number(e.target.value)) && setOppRate(Number(e.target.value))} />٪
+          <NumericInput aria-label="نرخ فرصت مشتری" className="w-16 rounded border border-slate-200 px-1.5 py-0.5 tabular-nums" value={oppRate} min={0} max={60} step={0.5} onChange={setOppRate} />٪
         </label>
         <button type="button" onClick={add} disabled={tiers.length >= MAX_TIERS} className="rounded-lg border border-slate-200 px-2 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40">
           + افزودن پله
