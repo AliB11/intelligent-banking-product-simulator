@@ -25,10 +25,11 @@ export const DEFAULT_UI_PARAMS: UiParams = {
 };
 
 export function sanitizeParams(input: unknown): SimParams {
-  const p = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+  const p = (input && typeof input === "object" && !Array.isArray(input) ? input : {}) as Record<string, unknown>;
   const num = (v: unknown, d: number, lo: number, hi: number) => {
+    if (typeof v !== "number" && (typeof v !== "string" || !v.trim())) return d;
     const n = Number(v);
-    return v !== null && v !== "" && Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d;
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d;
   };
   const customers = Math.round(num(p.customers, DEFAULT_PARAMS.customers, 500, 10000));
   const marketSize = num(p.marketSize, 1_000_000, 10_000, 50_000_000);

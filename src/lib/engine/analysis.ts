@@ -1,6 +1,6 @@
 import { CHANNELS, COLLATERALS, SCENARIOS } from "./catalog";
 import { checkCompliance, computeHealth } from "./advisor";
-import { clamp, mulberry32, type Rng } from "./math";
+import { clamp, isTieredPoints, mulberry32, type Rng } from "./math";
 import { simulatePortfolio } from "./simulator";
 import { mergeConfig } from "./templates";
 import type {
@@ -69,17 +69,20 @@ export function runSensitivity(cfg: ProductConfig, base: SimParams): TornadoItem
   const fast: SimParams = { ...resampleParams(base, 2500), runs: Math.min(base.runs, 6) };
   const baseProfit = simulatePortfolio(cfg, fast).kpis.netProfit;
   const k = cfg.kind;
+  const tiered = isTieredPoints(cfg);
+  const qardPoints = k === "points_loan" && cfg.contract === "qard" && !tiered;
   const vars: SensVar[] = [];
   if (k !== "loyalty") {
     vars.push({
       key: "rate",
-      label: k === "points_loan" ? "کارمزد وام امتیازی" : "نرخ سود",
-      lowLabel: k === "points_loan" ? "−۱.۵ واحد" : "−۳ واحد",
-      highLabel: k === "points_loan" ? "+۱.۵ واحد" : "+۳ واحد",
+      label: qardPoints ? "کارمزد وام امتیازی" : tiered ? "نرخ سود پله‌ها" : "نرخ سود",
+      lowLabel: qardPoints ? "−۱.۵ واحد" : "−۳ واحد",
+      highLabel: qardPoints ? "+۱.۵ واحد" : "+۳ واحد",
       apply: (c, p, d) => {
         const x = clone(c);
-        if (k === "points_loan") x.points.loanFee = clamp(x.points.loanFee + d * 1.5, 0, 8);
-        else x.credit.rate = clamp(x.credit.rate + d * 3, 0, 40);
+        if (tiered) x.points.tiers = x.points.tiers.map((t) => ({ ...t, rate: clamp(t.rate + d * 3, 0, 100) }));
+        else if (qardPoints) x.points.loanFee = clamp(x.points.loanFee + d * 1.5, 0, 100);
+        else x.credit.rate = clamp(x.credit.rate + d * 3, 0, 100);
         return [x, p];
       },
     });
@@ -113,9 +116,13 @@ export function runSensitivity(cfg: ProductConfig, base: SimParams): TornadoItem
     apply: (c, p, d) => [c, { ...p, inflation: Math.max(0, (p.inflation ?? SCENARIOS[p.scenario].inflation) + d * 15) }],
   });
   if (k === "points_loan") {
-    vars.push({
+    if (tiered) vars.push({
+      key: "alpha", label: "ضریب تسهیلات پله‌ها (α)", lowLabel: "−۲۰٪", highLabel: "+۲۰٪",
+      apply: (c, p, d) => { const x = clone(c); x.points.tiers = x.points.tiers.map((t) => ({ ...t, loanToAvgDepositPct: clamp(t.loanToAvgDepositPct * (1 + d * 0.2), 0, 1000) })); return [x, p]; },
+    });
+    else vars.push({
       key: "coef", label: "ضریب تبدیل امتیاز", lowLabel: "−۰.۵", highLabel: "+۰.۵",
-      apply: (c, p, d) => { const x = clone(c); x.points.coefficient = clamp(x.points.coefficient + d * 0.5, 0.5, 6); return [x, p]; },
+      apply: (c, p, d) => { const x = clone(c); x.points.coefficient = clamp(x.points.coefficient + d * 0.5, 0.01, 20); return [x, p]; },
     });
     vars.push({
       key: "usage", label: "نرخ استفاده از امتیاز", lowLabel: "−۱۵ واحد", highLabel: "+۱۵ واحد",
@@ -259,7 +266,8 @@ function evaluate(cfg: ProductConfig, params: SimParams, objective: Objective, r
       score = kp.netProfit;
       break;
     case "raroc":
-      score = cfg.kind === "loyalty" ? kp.loyaltyRoi : kp.raroc;
+      // Undefined capital returns must never win the ratio objective or serialize as Infinity.
+      score = cfg.kind === "loyalty" ? kp.loyaltyRoi : (kp.raroc ?? -Number.MAX_SAFE_INTEGER);
       break;
     case "inclusion":
       score = kp.netProfit >= 0 ? ((kp.inclusion / 100) * kp.approved) / 1000 : -1e6 + kp.netProfit;
@@ -267,7 +275,7 @@ function evaluate(cfg: ProductConfig, params: SimParams, objective: Objective, r
     default:
       score = computeHealth(cfg, sim, comp).score;
   }
-  return { score, feasible: comp.fails === 0, kpis: kp, x: (cfg.kind === "loyalty" ? kp.booked : kp.approved) / 1000, y: kp.netProfit };
+  return { score, feasible: comp.fails === 0 && (objective !== "raroc" || cfg.kind === "loyalty" || kp.raroc !== null), kpis: kp, x: (cfg.kind === "loyalty" ? kp.booked : kp.approved) / 1000, y: kp.netProfit };
 }
 
 export function runOptimizer(cfg: ProductConfig, base: SimParams, objective: Objective): OptimizerResult {
@@ -332,8 +340,8 @@ export function runOptimizer(cfg: ProductConfig, base: SimParams, objective: Obj
   return {
     objective,
     evaluations: evals.length,
-    baseline: { score: baseEval.score, kpis: baseFull.kpis },
-    best: { score: best.score, kpis: bestFull.kpis, config: best.cfg },
+    baseline: { score: baseEval.score, kpis: baseFull.kpis, feasible: baseEval.feasible },
+    best: { score: best.score, kpis: bestFull.kpis, config: best.cfg, feasible: best.feasible },
     changes,
     points,
     xLabel: cfg.kind === "loyalty" ? "اعضای جذب‌شده (هزار نفر)" : "مشتریان تأییدشده (هزار نفر)",

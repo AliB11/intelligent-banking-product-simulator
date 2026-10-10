@@ -15,6 +15,7 @@ test("liquidity-adjusted RAROC: points products split franchise from credit", ()
     const k = sim(key).kpis;
     assert.ok(k.liquidityCost > 0, `${key}: liquidity cost`);
     assert.ok(k.liquidityCapital > 0, `${key}: liquidity capital`);
+    assert.ok(k.raroc !== null && k.rarocCredit !== null && k.rarocLiquidity !== null);
     // Stripping the FTP benefit can only lower the return; charging liquidity can only lower it too.
     assert.ok(k.rarocCredit < k.raroc, `${key}: credit-only < headline`);
     assert.ok(k.rarocLiquidity < k.raroc, `${key}: liquidity-adjusted < headline`);
@@ -25,6 +26,7 @@ test("liquidity-adjusted RAROC: points products split franchise from credit", ()
 
 test("liquidity-adjusted RAROC equals RAROC for non-points products", () => {
   const k = sim("murabaha_card").kpis;
+  assert.ok(k.raroc !== null && k.rarocCredit !== null && k.rarocLiquidity !== null);
   assert.equal(k.liquidityCost, 0);
   assert.equal(k.liquidityCapital, 0);
   assert.ok(Math.abs(k.rarocCredit - k.raroc) < 1e-9);
@@ -34,6 +36,7 @@ test("liquidity-adjusted RAROC equals RAROC for non-points products", () => {
 test("franchise insight fires when value comes only from the deposit franchise", () => {
   const cfg = templateConfig("negin_farapuya")!;
   const r = sim("negin_farapuya");
+  assert.ok(r.kpis.raroc !== null && r.kpis.rarocCredit !== null);
   assert.ok(r.kpis.raroc > 0 && r.kpis.rarocCredit < 0, "Negin earns only through the deposit franchise");
   const ins = generateInsights(cfg, r, checkCompliance(cfg));
   assert.ok(ins.some((i) => i.id === "franchise"));

@@ -27,6 +27,12 @@ export function getPool(): Pool {
     connectionTimeoutMillis: 5000,
     idleTimeoutMillis: 30000,
     max: 10,
+    statement_timeout: 15000,
+    query_timeout: 20000,
+  });
+  // An idle connection can fail outside an awaited query; without a listener pg emits a fatal error.
+  pool.on("error", (error) => {
+    console.error("Idle PostgreSQL connection failed", { code: (error as { code?: string }).code, message: error.message });
   });
 
   // در production هم کش می‌کنیم تا در هر invocation یک Pool جدید ساخته نشود.

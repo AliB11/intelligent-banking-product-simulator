@@ -116,6 +116,16 @@ export function sampleBass(u: number, p: number, q: number, T: number): number {
 }
 
 // ---------- Amortization ----------
+/** JSON-safe display ceiling for undefined or extreme annual customer costs. */
+export const APR_LIMIT = 999;
+
+/** Stable annuity payment, including positive rates too small for (1 + r) to retain precision. */
+export function annuityPayment(principal: number, annualRate: number, months: number): number {
+  if (months <= 0) return principal;
+  const r = Math.max(0, annualRate) / 1200;
+  return r === 0 ? principal / months : principal * r / -Math.expm1(-months * Math.log1p(r));
+}
+
 export interface Schedule {
   pay: number[];
   int: number[];
@@ -200,14 +210,14 @@ export function buildSchedule(
     }
   } else if (method === "balloon") {
     const B = (P * clamp(balloonPct, 0, 90)) / 100;
-    const A = r === 0 ? (P - B) / n : ((P - B / Math.pow(1 + r, n)) * r) / (1 - Math.pow(1 + r, -n));
+    const A = r === 0 ? (P - B) / n : ((P - B * Math.exp(-n * Math.log1p(r))) * r) / -Math.expm1(-n * Math.log1p(r));
     installment = A;
     for (let i = 0; i < n; i++) {
       const it = b * r;
       push(it, i === n - 1 ? b : A - it);
     }
   } else {
-    const A = r === 0 ? P / n : (P * r) / (1 - Math.pow(1 + r, -n));
+    const A = annuityPayment(P, annualRate, n);
     installment = A;
     for (let i = 0; i < n; i++) {
       const it = b * r;
@@ -217,26 +227,54 @@ export function buildSchedule(
   return { pay, int, prin, bal, months: pay.length, installment, total: sum(pay) };
 }
 
+/**
+ * Conservative monthly affordability burden at today's income. Step-up / balloon / bullet
+ * contracts use their largest due payment. Seasonal payments reserve income over their actual
+ * payment interval (including a short final quarter), rather than pretending the first month is free.
+ */
+export function affordabilityPayment(schedule: Schedule, method: Repayment, grace = 0): number {
+  if (method !== "seasonal") return Math.max(0, ...schedule.pay);
+  let burden = Math.max(0, ...schedule.pay.slice(0, grace));
+  let interval = 0;
+  for (const payment of schedule.pay.slice(grace)) {
+    interval++;
+    if (payment > 0) {
+      burden = Math.max(burden, payment / interval);
+      interval = 0;
+    }
+  }
+  return burden;
+}
+
 // ---------- IRR / APR / NPV ----------
+/** Conventional cash-flow IRR. No sign change has no defined IRR and retains the legacy zero result. */
 export function irr(cfs: number[]): number {
+  if (!cfs.every(Number.isFinite) || !cfs.some((v) => v > 0) || !cfs.some((v) => v < 0)) return 0;
+  // Reverse Horner evaluation avoids separately overflowing discount powers near r = -1.
   const f = (r: number) => {
-    let v = 0;
-    for (let t = 0; t < cfs.length; t++) v += cfs[t] / Math.pow(1 + r, t);
+    let v = cfs[cfs.length - 1];
+    for (let t = cfs.length - 2; t >= 0; t--) v = cfs[t] + v / (1 + r);
     return v;
   };
-  let lo = -0.9;
-  let hi = 1.5;
+  if (f(0) === 0) return 0;
+  let lo = -1 + 1e-12;
+  let hi = 1;
   let flo = f(lo);
-  const fhi = f(hi);
-  if (flo * fhi > 0) return 0;
-  for (let i = 0; i < 90; i++) {
+  let fhi = f(hi);
+  const sameSign = (a: number, b: number) => Math.sign(a) === Math.sign(b);
+  for (let i = 0; i < 64 && sameSign(flo, fhi); i++) {
+    hi = 2 * hi + 1;
+    fhi = f(hi);
+  }
+  if (Number.isNaN(flo) || Number.isNaN(fhi) || sameSign(flo, fhi)) return 0;
+  for (let i = 0; i < 200; i++) {
     const mid = (lo + hi) / 2;
     const fm = f(mid);
-    if (fm * flo <= 0) hi = mid;
-    else {
+    if (fm === 0) return mid;
+    if (sameSign(fm, flo)) {
       lo = mid;
       flo = fm;
-    }
+    } else hi = mid;
   }
   return (lo + hi) / 2;
 }
@@ -260,11 +298,14 @@ export function effectiveApr(
   cdPct: number,
 ): number {
   const s = buildSchedule(P, rate, tenor, grace, method, stepUp, balloon);
-  const cfs = [P * (1 - upfrontFee / 100) - (P * cdPct) / 100];
+  if (P <= 0) return 0;
+  const netProceeds = P * (1 - upfrontFee / 100) - (P * cdPct) / 100;
+  if (netProceeds <= 0) return APR_LIMIT;
+  const cfs = [netProceeds];
   for (let m = 0; m < s.months; m++) cfs.push(-(s.pay[m] + (P * insurance) / 1200));
   cfs[cfs.length - 1] += (P * cdPct) / 100;
   const r = irr(cfs);
-  return (Math.pow(1 + r, 12) - 1) * 100;
+  return Math.min(APR_LIMIT, Math.expm1(12 * Math.log1p(r)) * 100);
 }
 
 /** True when a points product uses the multi-tier (Negin-style) murabaha menu. */

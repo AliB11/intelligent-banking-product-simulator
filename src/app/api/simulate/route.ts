@@ -14,20 +14,22 @@ export async function POST(req: Request) {
     const params = sanitizeParams(body.params);
     let cfg: ProductConfig;
     let productId: number | null = null;
+    let configVersion: number | undefined;
     if (body.productId !== undefined) {
       const p = await getProduct(Number(body.productId));
       if (!p) return Response.json({ error: "محصول یافت نشد" }, { status: 404 });
       cfg = p.config;
       productId = p.id;
+      configVersion = p.configVersion;
     } else {
       cfg = normalizeConfig(body.config);
     }
     const full = analyzeResult(cfg, simulatePortfolio(cfg, params));
     let simulationId: number | null = null;
     if (productId) {
-      simulationId = await savePortfolioResult(productId, cfg, full);
+      simulationId = await savePortfolioResult(productId, cfg, full, configVersion);
     }
-    return Response.json({ ...full, simulationId });
+    return Response.json({ ...full, config: cfg, configVersion, simulationId });
   } catch (e) {
     return apiFailure(e);
   }

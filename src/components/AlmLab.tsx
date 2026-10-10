@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { BarsChart, ComboChart, HeatGrid, OptionsScatter, Tornado } from "@/components/charts";
 import { Badge, Btn, Card, Num, Select, Spinner, Stat } from "@/components/ui";
+import type { FullAlmParams } from "@/lib/engine/alm";
 import { MAX_TIERS } from "@/lib/engine/templates";
 import type { FullAlmResult, NeginCustomerOption, ProductConfig, TieredMurabahaTier } from "@/lib/engine/types";
 import { count, faDate, fmt, money, mt, pct } from "@/lib/format";
@@ -38,13 +39,16 @@ export default function AlmLab({
   onApplyTiers,
   busy,
   latest = null,
+  active = true,
 }: {
   productId: number;
   cfg: ProductConfig;
   history: AlmHistItem[];
-  onSaved: (item: AlmHistItem) => void;
+  onSaved: (item: AlmHistItem, result: FullAlmResult, config: ProductConfig, configVersion?: number) => void;
   onApplyTiers: (tiers: TieredMurabahaTier[]) => Promise<void>;
   busy: boolean;
+  /** Preserve draft/result state across tabs, without rendering hidden charts. */
+  active?: boolean;
   /** latest stored run for the current configuration (compact: no monthly events / option menu) */
   latest?: { id: number; createdAt: string; summary: Record<string, unknown>; result: FullAlmResult } | null;
 }) {
@@ -54,11 +58,21 @@ export default function AlmLab({
       marketShare: num(s.marketShare) ?? 5,
       horizon: num(s.horizon) ?? 60,
       scenario: (typeof s.scenario === "string" && s.scenario in SCEN_LABEL ? s.scenario : "base") as AlmScenario,
-      seed: 1405,
+      seed: num(s.seed) ?? 1405,
       opportunityRate: num(s.opportunityRatePct) ?? 23,
     };
   });
-  const [designer, setDesigner] = useState({ maxHolePct: 40, minMarginPct: 2, maxLeverage: 2.5, objective: "margin" as Objective });
+  const [designer, setDesigner] = useState(() => {
+    const d = latest?.summary.designer as Record<string, unknown> | undefined;
+    return {
+      maxHolePct: num(d?.maxHolePct) ?? 40,
+      minMarginPct: num(d?.minMarginPct) ?? 2,
+      maxLeverage: num(d?.maxLeverage) ?? 2.5,
+      objective: (d?.objective === "liquidity" || d?.objective === "reach" ? d.objective : "margin") as Objective,
+    };
+  });
+  const [resultParams, setResultParams] = useState(latest ? params : null);
+  const [resultDesigner, setResultDesigner] = useState(latest ? designer : null);
   const [result, setResult] = useState<FullAlmResult | null>(latest?.result ?? null);
   const [resultCfg, setResultCfg] = useState<ProductConfig | null>(latest ? cfg : null);
   const [fromHistory, setFromHistory] = useState<string | null>(latest?.createdAt ?? null);
@@ -67,7 +81,8 @@ export default function AlmLab({
   const [selectedOpt, setSelectedOpt] = useState<string | null>(null);
   const [compare, setCompare] = useState<number[]>([]);
   const tiered = cfg.points.mode === "tiered_murabaha" && cfg.points.tiers.length > 0;
-  const stale = result !== null && resultCfg !== cfg;
+  const stale = result !== null && (JSON.stringify(resultCfg) !== JSON.stringify(cfg) ||
+    JSON.stringify(resultParams) !== JSON.stringify(params) || JSON.stringify(resultDesigner) !== JSON.stringify(designer));
 
   const run = async () => {
     setLoading(true);
@@ -78,10 +93,16 @@ export default function AlmLab({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ productId, ...params, designer, save: true }),
       });
-      const j = (await r.json()) as FullAlmResult & { simulationId?: number | null; error?: string };
+      const j = (await r.json()) as FullAlmResult & { config: ProductConfig; configVersion?: number; params: Omit<FullAlmParams, "product">; simulationId?: number | null; error?: string };
       if (!r.ok) throw new Error(j.error ?? "خطای سرور");
+      const usedParams = { marketShare: j.params.marketShare, horizon: j.params.horizon, scenario: j.params.scenario ?? "base", seed: j.params.seed ?? 1405, opportunityRate: j.params.opportunityRatePct ?? 23 };
+      const usedDesigner = { maxHolePct: j.params.designer?.maxHolePct ?? 40, minMarginPct: j.params.designer?.minMarginPct ?? 2, maxLeverage: j.params.designer?.maxLeverage ?? 2.5, objective: j.params.designer?.objective ?? "margin" };
       setResult(j);
-      setResultCfg(cfg);
+      setResultCfg(j.config);
+      setResultParams(usedParams);
+      setResultDesigner(usedDesigner);
+      setParams((current) => current === params ? usedParams : current);
+      setDesigner((current) => current === designer ? usedDesigner : current);
       setFromHistory(null);
       setSelectedOpt(null);
       if (j.simulationId) {
@@ -89,17 +110,17 @@ export default function AlmLab({
         onSaved({
           id: j.simulationId,
           type: "alm",
-          scenario: params.scenario,
+          scenario: usedParams.scenario,
           createdAt: new Date().toISOString(),
           summary: {
             maxHole: k.maxHole, holePct: k.totalDeposit > 0 ? (k.maxHole / k.totalDeposit) * 100 : 0, tippingPoint: k.tippingPoint,
             recoveryMonth: k.recoveryMonth, netMargin: k.netMargin, marginOnNetDeposit: k.marginOnNetDeposit, leverage: k.leverage,
             minLcr: k.minLcr, nsfrAt12: k.nsfrAt12, totalDeposit: k.totalDeposit, borrowers: k.borrowers,
             pTipping: j.analysis.monteCarlo?.pTipping ?? null, p95Hole: j.analysis.monteCarlo?.p95 ?? null,
-            marketShare: params.marketShare, horizon: params.horizon, scenario: params.scenario, opportunityRatePct: params.opportunityRate,
+            marketShare: usedParams.marketShare, horizon: usedParams.horizon, scenario: usedParams.scenario, opportunityRatePct: usedParams.opportunityRate, seed: usedParams.seed, designer: usedDesigner,
             tiers: j.alm.tiers.map((t) => ({ name: t.tier.name, wait: t.tier.waitingMonths, alpha: t.tier.loanToAvgDepositPct, rate: t.tier.rate, tenor: t.tier.repaymentMonths, share: t.tier.expectedTakeUpShare })),
           },
-        });
+        }, j, j.config, j.configVersion);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -135,7 +156,7 @@ export default function AlmLab({
   const cell = (r: number, c: number) => grid.find((x) => x.takeUpShock === r && x.approvalShock === c);
 
   const addOptionAsTier = async () => {
-    if (!chosen || !tiered || cfg.points.tiers.length >= MAX_TIERS) return;
+    if (!chosen || !tiered || stale || loading || busy || cfg.points.tiers.length >= MAX_TIERS) return;
     const tier: TieredMurabahaTier = {
       name: `گزینه ${fmt(chosen.waitingMonths)} ماهه`,
       waitingMonths: chosen.waitingMonths,
@@ -148,6 +169,7 @@ export default function AlmLab({
     await onApplyTiers([...cfg.points.tiers, tier]);
   };
 
+  if (!active) return null;
   return (
     <div className="space-y-4">
       <Card title="آزمایشگاه ALM — نقدینگی و ترازنامه محصول" icon="🌊" subtitle="جریان نقد ماهانه سپرده، اعطا، اقساط و برداشت؛ کسری با نرخ بین‌بانکی تأمین و مازاد با FTP سرمایه‌گذاری می‌شود (فقط در سود و زیان).">
@@ -155,13 +177,13 @@ export default function AlmLab({
           <Select<AlmScenario> label="سناریو" value={params.scenario} onChange={(v) => setParams((p) => ({ ...p, scenario: v }))} options={(Object.keys(SCEN_LABEL) as AlmScenario[]).map((s) => ({ value: s, label: SCEN_LABEL[s] }))} />
           <Num label="سهم از بازار ۵۰ همتی" value={params.marketShare} onChange={(v) => setParams((p) => ({ ...p, marketShare: v }))} min={0.1} max={50} step={0.5} unit="٪" />
           <Num label="افق" value={params.horizon} onChange={(v) => setParams((p) => ({ ...p, horizon: v }))} min={12} max={120} step={6} unit="ماه" />
-          <Num label="نرخ فرصت مشتری" value={params.opportunityRate} onChange={(v) => setParams((p) => ({ ...p, opportunityRate: v }))} min={0} max={60} step={0.5} unit="٪" hint="سود سپرده جایگزین؛ مبنای هزینه تمام‌شده" />
-          <Num label="بذر تصادفی" value={params.seed} onChange={(v) => setParams((p) => ({ ...p, seed: Math.max(1, Math.round(v)) }))} min={1} max={999999} step={1} />
+          <Num label="نرخ فرصت مشتری" value={params.opportunityRate} onChange={(v) => setParams((p) => ({ ...p, opportunityRate: v }))} min={0} max={100} step={0.5} unit="٪" hint="سود سپرده جایگزین؛ مبنای هزینه تمام‌شده" />
+          <Num label="بذر تصادفی" value={params.seed} onChange={(v) => setParams((p) => ({ ...p, seed: Math.max(1, Math.round(v)) }))} min={1} max={2147483647} step={1} />
           <Btn onClick={run} disabled={loading || busy} className="h-10">{loading ? <Spinner /> : "▶"} اجرا و ثبت در تاریخچه</Btn>
         </div>
         {error && <div role="alert" className="mt-2 rounded-lg bg-rose-50 p-2 text-sm text-rose-700">{error}</div>}
         {fromHistory && !stale && <div role="status" className="mt-2 rounded-lg bg-sky-50 p-2 text-sm text-sky-900">نمایش آخرین اجرای ثبت‌شده ({faDate(fromHistory)}). منوی گزینه‌های مشتری در نسخه ذخیره‌شده نگه داشته نمی‌شود؛ برای دیدن مرز پارتو دوباره اجرا کنید.</div>}
-        {stale && <div role="status" className="mt-2 rounded-lg bg-amber-50 p-2 text-sm text-amber-900">پیکربندی محصول پس از این اجرا تغییر کرده است؛ برای نتایج تازه دوباره اجرا کنید.</div>}
+        {stale && <div role="status" className="mt-2 rounded-lg bg-amber-50 p-2 text-sm text-amber-900">پارامترها، قیود طراح یا پیکربندی محصول تغییر کرده‌اند؛ نتایج فعلی متعلق به اجرای قبلی هستند. دوباره اجرا کنید.</div>}
       </Card>
 
       {!result && (
@@ -182,6 +204,7 @@ export default function AlmLab({
             <Stat label="حداقل LCR (آموزشی)" value={pct(k.minLcr, 0)} tone={k.minLcr >= 100 ? "good" : "bad"} sub="بافر مستقل محصول" icon="💧" />
             <Stat label="NSFR ماه ۱۲" value={pct(k.nsfrAt12, 0)} tone={k.nsfrAt12 >= 100 ? "good" : "bad"} icon="🧱" />
             <Stat label="شکاف سررسید (WAL)" value={`${fmt(k.maturityGap, 1)} ماه`} sub={`دارایی ${fmt(k.walAssets, 1)} / بدهی ${fmt(k.walLiabilities, 1)}`} icon="📏" />
+            <Stat label="درآمد کارمزد اولیه" value={money(k.totalFeeIncome)} icon="🧾" />
             <Stat label="ذخیره زیان اعتباری" value={money(k.totalProvision)} icon="🛡️" />
             <Stat label="اقساط فراتر از افق" value={money(k.pmtBeyondHorizon)} icon="➡️" />
             <Stat label="احتمال شکست (MC)" value={pct(result.analysis.monteCarlo?.pTipping ?? 0, 0)} sub={`P95 حفره: ${money(result.analysis.monteCarlo?.p95 ?? 0)}`} icon="🎲" />
@@ -204,8 +227,8 @@ export default function AlmLab({
             />
           </Card>
 
-          <Card title="اقتصاد پله‌ها و هزینه تمام‌شده مشتری" icon="🪜" subtitle={`هزینه تمام‌شده = IRR سالانه جریان [وام − هزینه فرصت انتظار، −اقساط] با نرخ فرصت ${fmt(params.opportunityRate, 1)}٪ — نرخ اسمی به‌تنهایی گمراه‌کننده است.`}>
-            <div className="overflow-x-auto">
+          <Card title="اقتصاد پله‌ها و هزینه تمام‌شده مشتری" icon="🪜" subtitle={`هزینه تمام‌شده = IRR سالانه جریان [وام خالص پس از کارمزد − هزینه فرصت انتظار، −اقساط و بیمه] با نرخ فرصت ${fmt(resultParams?.opportunityRate ?? 23, 1)}٪ — نرخ اسمی به‌تنهایی گمراه‌کننده است.`}>
+            <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="اقتصاد پله‌ها">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b text-slate-500">
@@ -275,7 +298,7 @@ export default function AlmLab({
               </div>
               <div className="mt-2 text-xs text-slate-600">احتمال زیان حاشیه: {pct(result.analysis.monteCarlo?.pLoss ?? 0, 0)} • بدترین حفره: {money(result.analysis.monteCarlo?.worstCaseMaxHole ?? 0)}</div>
             </Card>
-            <Card title="ماژول‌های مکمل" icon="🧩">
+            <Card title="ماژول‌های مکمل" icon="🧩" subtitle="این سنجه‌ها تحلیل جداگانه‌اند و هنوز به جریان نقد پایه و حاشیه آن اعمال نشده‌اند.">
               <div className="space-y-3 text-xs leading-6">
                 {result.prepayment && (
                   <div className="rounded-xl bg-slate-50 p-3">
@@ -322,7 +345,7 @@ export default function AlmLab({
                       <div>هزینه کل مشتری: {mt(chosen.effectiveCustomerCost, 1)}</div>
                       <div>بازده مؤثر بانک: <b>{pct(chosen.bankEffectiveYield, 1)}</b></div>
                       {tiered ? (
-                        <Btn className="mt-2 w-full" variant="ghost" disabled={busy || cfg.points.tiers.length >= MAX_TIERS} onClick={addOptionAsTier}>
+                        <Btn className="mt-2 w-full" variant="ghost" disabled={busy || loading || stale || cfg.points.tiers.length >= MAX_TIERS} onClick={addOptionAsTier}>
                           ➕ افزودن به منوی پله‌ها (سهم اولیه ۵٪)
                         </Btn>
                       ) : (
@@ -341,8 +364,8 @@ export default function AlmLab({
             <div className="grid items-end gap-4 md:grid-cols-4">
               <Select<Objective> label="هدف" value={designer.objective} onChange={(v) => setDesigner((d) => ({ ...d, objective: v }))} options={(Object.keys(OBJ_LABEL) as Objective[]).map((o) => ({ value: o, label: OBJ_LABEL[o] }))} />
               <Num label="سقف حفره" value={designer.maxHolePct} onChange={(v) => setDesigner((d) => ({ ...d, maxHolePct: v }))} min={0} max={100} step={1} unit="٪ سپرده" />
-              <Num label="حداقل حاشیه" value={designer.minMarginPct} onChange={(v) => setDesigner((d) => ({ ...d, minMarginPct: v }))} min={-20} max={100} step={0.5} unit="٪" />
-              <Num label="سقف اهرم" value={designer.maxLeverage} onChange={(v) => setDesigner((d) => ({ ...d, maxLeverage: v }))} min={0.5} max={10} step={0.1} />
+              <Num label="حداقل حاشیه" value={designer.minMarginPct} onChange={(v) => setDesigner((d) => ({ ...d, minMarginPct: v }))} min={-100} max={200} step={0.5} unit="٪" />
+              <Num label="سقف اهرم" value={designer.maxLeverage} onChange={(v) => setDesigner((d) => ({ ...d, maxLeverage: v }))} min={0.1} max={20} step={0.1} />
             </div>
             {!design ? (
               <div className="mt-3 text-sm text-slate-500">طراح معکوس به دست‌کم دو پله نیاز دارد.</div>
@@ -353,7 +376,7 @@ export default function AlmLab({
                 ) : (
                   <div className="rounded-lg bg-emerald-50 p-2 text-xs text-emerald-900">طرح پیشنهادی همه قیود را برآورده می‌کند.</div>
                 )}
-                <div className="overflow-x-auto">
+                <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="سهم پله‌های پیشنهادی">
                   <table className="w-full text-xs">
                     <thead>
                       <tr className="border-b text-slate-500"><th className="p-2 text-right">پله</th><th className="p-2">سهم فعلی</th><th className="p-2">سهم پیشنهادی</th><th className="p-2">تغییر</th></tr>
@@ -380,7 +403,7 @@ export default function AlmLab({
                 </div>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-[11px] text-slate-500">سهم پله‌ها فرض تقاضاست؛ اعمال آن یعنی بانک با بازاریابی و سقف ظرفیت پله‌ها این ترکیب را هدف می‌گیرد.</span>
-                  {tiered && <Btn variant="ghost" disabled={busy} onClick={() => onApplyTiers(design.tiers.map((t, i) => ({ ...cfg.points.tiers[i], expectedTakeUpShare: t.expectedTakeUpShare })))}>✅ اعمال سهم‌های پیشنهادی</Btn>}
+                  {tiered && <Btn variant="ghost" disabled={busy || loading || stale} onClick={() => onApplyTiers(design.tiers.map((t, i) => ({ ...cfg.points.tiers[i], expectedTakeUpShare: t.expectedTakeUpShare })))}>✅ اعمال سهم‌های پیشنهادی</Btn>}
                 </div>
               </div>
             )}
@@ -393,7 +416,7 @@ export default function AlmLab({
           <div className="py-6 text-center text-sm text-slate-500">هنوز اجرای ALM ثبت نشده است.</div>
         ) : (
           <div className="space-y-4">
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="تاریخچه اجرای ALM">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b text-slate-500">
@@ -465,7 +488,7 @@ function VersionCompare({ items }: { items: AlmHistItem[] }) {
   };
   return (
     <div className="space-y-3">
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="مقایسه پله‌های طراحی">
         <table className="w-full text-xs">
           <thead>
             <tr className="border-b text-slate-500">

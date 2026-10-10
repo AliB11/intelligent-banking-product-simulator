@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
+import { bannerColor } from "@/lib/color";
 import { ComboChart, DnaRadar } from "@/components/charts";
 import TierTable from "@/components/TierTable";
 import { Badge, Btn, Card, COMP_LEVEL, Gauge, LEVEL, Num, Select, Spinner, Stat, Tabs, TextField, Toggle } from "@/components/ui";
@@ -18,7 +19,7 @@ import { fmt, money, mt, pct } from "@/lib/format";
 type Section = "credit" | "risk" | "funding" | "points" | "loyalty";
 type TabKey = "identity" | "pricing" | "structure" | "risk" | "funding" | "points" | "loyalty";
 
-export default function Studio({ initial, productId }: { initial: ProductConfig; productId?: number }) {
+export default function Studio({ initial, productId, configVersion }: { initial: ProductConfig; productId?: number; configVersion?: number }) {
   const router = useRouter();
   const [cfg, setCfg] = useState<ProductConfig>(initial);
   const [tab, setTab] = useState<TabKey>("identity");
@@ -94,7 +95,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
       const res = await fetch(productId ? `/api/products/${productId}` : "/api/products", {
         method: productId ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ config: cfg }),
+        body: JSON.stringify({ config: cfg, configVersion }),
       });
       const j = (await res.json()) as { id?: number; error?: string };
       if (!res.ok || !j.id) throw new Error(j.error ?? "خطا در ذخیره");
@@ -110,9 +111,9 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
   const enumOpts = <T extends string>(rec: Record<T, { label: string }>) => (Object.keys(rec) as T[]).map((k) => ({ value: k, label: rec[k].label }));
 
   return (
-    <div className="grid gap-5 lg:grid-cols-12">
+    <div className="grid min-w-0 gap-5 lg:grid-cols-12">
       {/* ------------- configuration ------------- */}
-      <div className="space-y-4 lg:col-span-7">
+      <div className="min-w-0 space-y-4 lg:col-span-7">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h1 className="text-2xl font-black text-slate-900">🧪 کارگاه طراحی محصول</h1>
@@ -277,7 +278,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
           >
             {tiered && (
               <div className="mb-4">
-                <TierTable tiers={cfg.points.tiers} upfrontFee={cfg.credit.upfrontFee} insurance={cfg.credit.insurance} contract={cfg.contract === "qard" ? "qard" : "murabaha"} depositRate={cfg.points.depositRate} onChange={(t) => setS("points", "tiers", t)} />
+                <TierTable tiers={cfg.points.tiers} loanCap={Math.min(cfg.credit.maxAmount, cfg.points.maxLoan, cfg.points.individualLoanCap)} minLoan={cfg.credit.minAmount} minDeposit={cfg.points.minOpeningDeposit} upfrontFee={cfg.credit.upfrontFee} insurance={cfg.credit.insurance} contract={cfg.contract === "qard" ? "qard" : "murabaha"} depositRate={cfg.points.depositRate} onChange={(t) => setS("points", "tiers", t)} />
               </div>
             )}
             <div className="grid gap-4 sm:grid-cols-2">
@@ -287,7 +288,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
               <Num label="سقف وام امتیازی" value={cfg.points.maxLoan} onChange={(v) => setS("points", "maxLoan", v)} min={10} max={2000} step={10} unit="م.ت" />
               <Num label="نرخ استفاده از امتیاز (رفتاری)" value={cfg.points.usageRate} onChange={(v) => setS("points", "usageRate", v)} min={5} max={100} step={1} unit="٪" hint="بقیه امتیازها سوخت یا ذخیره می‌شوند" />
               <Num label="جایزه/سود حساب امتیازی" value={cfg.points.depositRate} onChange={(v) => setS("points", "depositRate", v)} min={0} max={10} step={0.01} unit="٪" warn={cfg.contract === "qard" && cfg.points.depositRate > 0} hint={cfg.contract === "qard" ? "حساب قرض‌الحسنه سود قطعی ندارد" : undefined} />
-              <Num label="انقضای امتیاز (۰ = ندارد)" value={cfg.points.expiryMonths} onChange={(v) => setS("points", "expiryMonths", v)} min={0} max={60} step={1} unit="ماه" />
+              <Num label="انقضای امتیاز (۰ = ندارد)" value={cfg.points.expiryMonths} onChange={(v) => setS("points", "expiryMonths", v)} min={0} max={60} step={1} unit="ماه" hint="در مدل فعلی فقط اثر فرضی بر تقاضا دارد؛ دفتر امتیاز با انقضای واقعی مدل نشده است." />
               <Toggle label="قابلیت انتقال امتیاز" checked={cfg.points.transferable} onChange={(v) => setS("points", "transferable", v)} hint="انتقال به بستگان درجه یک یا کارکنان" />
             </div>
             {!tiered && <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/60 p-3">
@@ -339,9 +340,9 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
       </div>
 
       {/* ------------- live preview ------------- */}
-      <div className="space-y-4 lg:col-span-5">
+      <div className="min-w-0 space-y-4 lg:col-span-5">
         <div className="lg:sticky lg:top-20 space-y-4">
-          <div className="relative overflow-hidden rounded-3xl p-5 text-white shadow-xl" style={{ background: `linear-gradient(135deg, ${cfg.color}, #0f172a 85%)` }}>
+          <div className="relative overflow-hidden rounded-3xl p-5 text-white shadow-xl" style={{ background: `linear-gradient(135deg, ${bannerColor(cfg.color)}, #0f172a 85%)` }}>
             <div className="hero-grid absolute inset-0 opacity-40" />
             <div className="relative">
               <div className="flex items-start justify-between">
@@ -368,14 +369,14 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
           >
             {preview && kp ? (
               <div className={computing ? "opacity-60 transition" : "transition"}>
-                <div className="grid grid-cols-[150px_1fr] items-center gap-3">
+                <div className="grid items-center gap-3 sm:grid-cols-[150px_minmax(0,1fr)]">
                   <Gauge value={preview.health.score} label={`${preview.health.grade} • ${preview.health.label}`} size={150} />
                   <div className="grid grid-cols-2 gap-2">
                     <Stat label="سود خالص" value={money(kp.netProfit)} tone={kp.netProfit >= 0 ? "good" : "bad"} />
                     {isLoyalty ? (
                       <Stat label="بازده باشگاه" value={pct(kp.loyaltyRoi, 0)} tone={kp.loyaltyRoi >= 0 ? "good" : "bad"} />
                     ) : (
-                      <Stat label="RAROC" value={pct(kp.raroc, 0)} tone={kp.raroc >= cfg.funding.targetRoe ? "good" : "warn"} />
+                      <Stat label="RAROC" value={pct(kp.raroc, 0)} tone={kp.raroc === null ? "neutral" : kp.raroc >= cfg.funding.targetRoe ? "good" : "warn"} sub={kp.raroc === null ? "بدون سرمایه مبنای معتبر" : undefined} />
                     )}
                     <Stat label={isLoyalty ? "اعضا" : "نرخ تأیید"} value={isLoyalty ? fmt(kp.booked) : pct(kp.approvalRate, 0)} />
                     <Stat label={isLoyalty ? "نرخ پاداش" : "NPL"} value={isLoyalty ? pct(rewardRate(cfg.loyalty.pointsPer100k, cfg.loyalty.pointValue), 2) : pct(kp.nplEnd)} tone={!isLoyalty && kp.nplEnd > 8 ? "bad" : "neutral"} />

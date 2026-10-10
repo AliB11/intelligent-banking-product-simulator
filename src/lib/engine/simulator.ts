@@ -1,8 +1,10 @@
 import { CBI, LIQUIDITY, CHANNELS, COLLATERALS, EMPLOYMENT_LABELS, SCENARIOS, SCORE_BANDS, rewardRate } from "./catalog";
 import {
+  affordabilityPayment,
   aprFor,
   buildSchedule,
   clamp,
+  effectiveApr,
   irbRetailK,
   isTieredPoints,
   pointsLoanRate,
@@ -83,6 +85,8 @@ export interface Check {
 
 export interface UnderwriteResult {
   applyProb: number;
+  /** Contract APR of the actual selected tier, not the weighted product menu. */
+  apr: number;
   eligible: boolean;
   checks: Check[];
   drivers: Driver[];
@@ -196,6 +200,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   const tenor = Math.max(1, Math.round(tier ? tier.repaymentMonths : cr.tenor));
   const grace = isPoints ? 0 : cr.grace;
   const downPct = isPoints ? 0 : cr.downPayment;
+  const apr = tier ? effectiveApr(100, rate, tenor, 0, "annuity", 0, 0, pointsUpfrontFee(cfg), cr.insurance, 0) : ctx.apr;
   const score = observedScore(c, rk.altData);
   const checks: Check[] = [];
   const drivers: Driver[] = [];
@@ -206,7 +211,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   if (needOverride === undefined && cfg.purpose === "working_capital" && c.employment !== "self") need *= 0.5;
   const seg = segmentFit(cfg.segment, c);
   const chan = channelFit(cfg.channel, c.digital);
-  const price = isLoyalty ? 1 : clamp(Math.exp(-c.priceSens * 0.07 * (ctx.apr - ctx.marketRate)), 0.15, 3);
+  const price = isLoyalty ? 1 : clamp(Math.exp(-c.priceSens * 0.07 * (apr - ctx.marketRate)), 0.15, 3);
   const amountFit = isLoyalty || need <= maxAmt ? 1 : 0.55 + 0.45 * (maxAmt / Math.max(1, need));
   const rr = rewardRate(ly.pointsPer100k, ly.pointValue);
   const loyaltyAttract =
@@ -225,9 +230,9 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
     const desired = clamp(need, cr.minAmount, maxAmt);
     if (tier) {
       // tiered murabaha: loan = α × average balance after the tier's waiting period
-      const alpha = Math.max(0.01, tier.loanToAvgDepositPct / 100);
-      deposit = Math.min(avail, desired / alpha);
-      holdMonths = Math.max(1, tier.waitingMonths);
+      const alpha = Math.max(0, tier.loanToAvgDepositPct / 100);
+      deposit = alpha > 0 ? Math.min(avail, desired / alpha) : avail;
+      holdMonths = Math.max(0, tier.waitingMonths);
       pointsCap = deposit >= tier.minAvgDeposit ? alpha * deposit : 0;
     } else {
       const minHold = Math.max(1, pt.minHoldingDays / 30);
@@ -235,7 +240,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
       const required = (desired * tenor) / (Math.max(0.1, pt.coefficient) * Math.max(minHold, 3));
       deposit = Math.min(avail, required);
       holdMonths = deposit > 0.5 ? (desired * tenor) / (Math.max(0.1, pt.coefficient) * deposit) : 99;
-      holdMonths = clamp(holdMonths, minHold, 12);
+      holdMonths = clamp(holdMonths, minHold, Math.max(12, minHold));
       pointsCap = (pt.coefficient * deposit * holdMonths) / tenor;
     }
     waitDays = Math.round(holdMonths * 30);
@@ -277,7 +282,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   if (isLoyalty) {
     checks.push({ ok: true, label: "عضویت در باشگاه", detail: "عضویت برای همه دارندگان حساب و کارت آزاد است" });
     return {
-      applyProb, eligible: true, checks, drivers, score, need, amount: 0, financed: 0, limit: 0, drawn: 0, installment: 0,
+      applyProb, apr, eligible: true, checks, drivers, score, need, amount: 0, financed: 0, limit: 0, drawn: 0, installment: 0,
       dti: (c.existingDebt / Math.max(0.5, c.income)) * 100, pd: 0, lgd: 0, tenor, rate, deposit, holdMonths, waitDays, reducedByDti: false, tierIndex,
     };
   }
@@ -288,6 +293,11 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
     checks.push({ ok: false, label, detail });
   };
   const pass = (label: string, detail: string) => checks.push({ ok: true, label, detail });
+
+  if (isPoints) {
+    if (deposit >= pt.minOpeningDeposit) pass("حداقل افتتاح حساب", `سپرده ${fa(deposit, 1)} میلیون به حداقل افتتاح حساب می‌رسد`);
+    else fail("حداقل افتتاح حساب", `سپرده ${fa(deposit, 1)} میلیون کمتر از حداقل ${fa(pt.minOpeningDeposit, 1)} میلیون است`);
+  }
 
   // 1) credit score
   if (score >= rk.minScore) pass("امتیاز اعتباری", `امتیاز ${fa(score)} ≥ حد نصاب ${fa(rk.minScore)}`);
@@ -349,28 +359,34 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   let drawn = 0;
   let financed = 0;
   let inst = 0;
+  let affordability = 0;
   const compute = () => {
     if (isRev) {
       limit = amount;
       drawn = (limit * cr.utilization) / 100;
       financed = drawn;
       inst = drawn * (rate / 1200 + 1 / tenor);
+      affordability = inst;
     } else {
       financed = amount * (1 - downPct / 100);
-      inst = buildSchedule(financed, rate, tenor, grace, isPoints ? "annuity" : cr.repayment, cr.stepUp, cr.balloon).installment;
+      const method = isPoints ? "annuity" : cr.repayment;
+      const schedule = buildSchedule(financed, rate, tenor, grace, method, cr.stepUp, cr.balloon);
+      inst = schedule.installment;
+      affordability = affordabilityPayment(schedule, method, grace);
     }
+    affordability += financed * cr.insurance / 1200;
   };
   compute();
-  let dti = ((inst + c.existingDebt) / Math.max(0.5, c.income)) * 100;
+  let dti = ((affordability + c.existingDebt) / Math.max(0.5, c.income)) * 100;
   let reducedByDti = false;
   if (dti > rk.maxDti) {
     const room = (rk.maxDti / 100) * c.income - c.existingDebt;
-    if (room <= 0 || inst <= 0) {
+    if (room <= 0 || affordability <= 0) {
       fail("توان بازپرداخت (DTI)", `اقساط فعلی ${fa(c.existingDebt, 1)} میلیون، سقف ${fa(rk.maxDti)}٪ درآمد را پر کرده است`);
     } else {
-      amount *= room / inst;
+      amount *= room / affordability;
       compute();
-      dti = ((inst + c.existingDebt) / Math.max(0.5, c.income)) * 100;
+      dti = ((affordability + c.existingDebt) / Math.max(0.5, c.income)) * 100;
       reducedByDti = true;
     }
   }
@@ -380,7 +396,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
     } else {
       pass(
         "توان بازپرداخت (DTI)",
-        `نسبت اقساط به درآمد ${fa(dti, 1)}٪${reducedByDti ? " — مبلغ تا سقف توان بازپرداخت کاهش یافت" : ""}`,
+        `نسبت بیشترین بار بازپرداخت به درآمد ${fa(dti, 1)}٪${reducedByDti ? " — مبلغ تا سقف توان بازپرداخت کاهش یافت" : ""}`,
       );
     }
   }
@@ -396,7 +412,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   z += add("وضعیت اشتغال", EMP_PD[c.employment]);
   z += add("نوع وثیقه و تضمین", col.pdEffect);
   z += add("نوع محصول", KIND_PD[k]);
-  z += add("انتخاب نامطلوب (قیمت بالاتر از بازار)", 0.07 * Math.max(0, ctx.apr - ctx.marketRate));
+  z += add("انتخاب نامطلوب (قیمت بالاتر از بازار)", 0.07 * Math.max(0, apr - ctx.marketRate));
   z += add("سن", c.age < 25 ? 0.25 : c.age > 62 ? 0.1 : 0);
   z += add("طول دوره بازپرداخت", 0.004 * (tenor - 24));
   if (rk.behavioral) z += add("پایش رفتاری و هشدار زودهنگام", -0.15);
@@ -414,7 +430,7 @@ export function underwrite(cfg: ProductConfig, c: Customer, ctx: MarketCtx, need
   lgd = clamp(lgd + ctx.scenario.lgdShift, 0.02, 0.95);
 
   return {
-    applyProb, eligible, checks, drivers, score, need, amount, financed, limit, drawn, installment: inst, dti, pd, lgd,
+    applyProb, apr, eligible, checks, drivers, score, need, amount, financed, limit, drawn, installment: inst, dti, pd, lgd,
     tenor, rate, deposit, holdMonths, waitDays, reducedByDti, tierIndex,
   };
 }
@@ -696,7 +712,7 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
 
       if (isPoints) {
         const D = b.uw.deposit;
-        const hold = Math.max(1, Math.ceil(b.uw.holdMonths));
+        const hold = Math.max(0, Math.ceil(b.uw.holdMonths));
         const loanOk = b.uw.eligible && b.takes && !!b.sch;
         const loanStart = b.start + hold;
         const rejected = !b.uw.eligible;
@@ -846,7 +862,11 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
   const safeOut = Math.max(avgOut, 1e-6);
   const ec = ecS * toB;
   const rc = (((avgOut * fnd.riskWeight) / 100) * fnd.targetCar) / 100;
-  const capital = Math.max(ec, rc, 1e-6);
+  const capital = Math.max(ec, rc);
+  // An epsilon denominator invents extreme returns when there is no credit/capital basis.
+  // Preserve the undefined state in JSON instead; liquidity capital may still support its own ratio.
+  const annualReturn = (profit: number, basis: number): number | null =>
+    isLoyalty || basis <= 0 ? null : ((profit * annual) / basis) * 100;
   const volume = (volTot / R) * toB;
   const bookedAvg = bookedTot / R;
   const defAvg = defTot / R;
@@ -924,15 +944,15 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
     preTaxProfit: preTax,
     netProfit,
     avgOutstanding: avgOut,
-    roa: isLoyalty ? 0 : ((netProfit * annual) / safeOut) * 100,
-    raroc: isLoyalty ? 0 : ((netProfit * annual) / capital) * 100,
-    rarocCredit: isLoyalty ? 0 : (((netProfit - (isPoints ? benefitT * afterTax : 0)) * annual) / capital) * 100,
-    rarocLiquidity: isLoyalty ? 0 : (((netProfit - liqCost * afterTax) * annual) / (capital + liqCapital)) * 100,
+    roa: annualReturn(netProfit, avgOut),
+    raroc: annualReturn(netProfit, capital),
+    rarocCredit: annualReturn(netProfit - (isPoints ? benefitT * afterTax : 0), capital),
+    rarocLiquidity: annualReturn(netProfit - liqCost * afterTax, capital + liqCapital),
     liquidityCost: liqCost,
     liquidityCapital: liqCapital,
     economicCapital: ec,
     regulatoryCapital: rc,
-    nim: isLoyalty ? 0 : (((interestIncome + feeIncome + benefitT - fundingCost) * annual) / safeOut) * 100,
+    nim: annualReturn(interestIncome + feeIncome + benefitT - fundingCost, avgOut),
     apr: ctx.apr,
     npv: npv(cofBase / 1200, series.map((x) => x.profit)),
     realYield: isLoyalty || avgOut <= 1e-6 ? 0 : ((1 + ((interestIncome + feeIncome - lossesT) * annual) / safeOut) / (1 + ctx.inflation / 100) - 1) * 100,

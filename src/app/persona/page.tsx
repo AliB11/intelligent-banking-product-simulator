@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { BarsChart, ComboChart } from "@/components/charts";
 import { Badge, Card, Num, Select, Stat, Toggle } from "@/components/ui";
 import { EMPLOYMENT_LABELS, KINDS, REGION_LABELS, rewardRate, scoreGrade } from "@/lib/engine/catalog";
-import { aprFor, pointsLoanLimit } from "@/lib/engine/math";
+import { pointsLoanLimit } from "@/lib/engine/math";
 import { PERSONAS, personaToCustomer, type Employment, type PersonaInput, type Region } from "@/lib/engine/population";
 import { marketContext, observedScore, repaymentPreview, underwrite } from "@/lib/engine/simulator";
 import { TEMPLATES, templateConfig } from "@/lib/engine/templates";
@@ -21,18 +21,23 @@ export default function PersonaPage() {
   const [items, setItems] = useState<Item[]>([]);
   const [choice, setChoice] = useState<string>("tpl:murabaha_card");
   const [persona, setPersona] = useState<PersonaInput>(PERSONAS[0]);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const choiceTouched = useRef(false);
 
   useEffect(() => {
-    fetch("/api/products")
-      .then((r) => r.json())
+    const controller = new AbortController();
+    fetch("/api/products", { signal: controller.signal })
+      .then((r) => { if (!r.ok) throw new Error("دریافت محصولات ذخیره‌شده ناموفق بود؛ الگوها همچنان در دسترس هستند."); return r.json(); })
       .then((j: { items?: Item[] }) => {
         const list = j.items ?? [];
         setItems(list);
         const q = new URLSearchParams(window.location.search).get("product");
+        if (choiceTouched.current) return;
         if (q && list.some((i) => String(i.id) === q)) setChoice(`id:${q}`);
         else if (list.length) setChoice(`id:${list[0].id}`);
       })
-      .catch(() => undefined);
+      .catch((e) => { if (!controller.signal.aborted) setStorageError(e instanceof Error ? e.message : "ارتباط با سرور برقرار نشد؛ از الگوها استفاده کنید."); });
+    return () => controller.abort();
   }, []);
 
   const cfg: ProductConfig | null = useMemo(() => {
@@ -48,7 +53,7 @@ export default function PersonaPage() {
     const ctx = marketContext(cfg, 26, "base");
     const uw = underwrite(cfg, c, ctx, cfg.kind === "loyalty" ? undefined : persona.need);
     const sched = cfg.kind !== "loyalty" && cfg.kind !== "credit_card" && cfg.kind !== "credit_line" && uw.amount > 0 ? repaymentPreview(cfg, uw.amount, uw.tierIndex) : null;
-    return { c, uw, sched, apr: aprFor(cfg), bureau: observedScore(c, false), alt: observedScore(c, true) };
+    return { c, uw, sched, apr: uw.apr, bureau: observedScore(c, false), alt: observedScore(c, true) };
   }, [cfg, persona]);
 
   const productOptions = [
@@ -71,7 +76,7 @@ export default function PersonaPage() {
       const limit = tier
         ? d / 30 >= tier.waitingMonths && uw.deposit >= tier.minAvgDeposit ? (tier.loanToAvgDepositPct / 100) * uw.deposit : 0
         : pointsLoanLimit(uw.deposit, d / 30, cfg.credit.tenor, cfg.points.coefficient);
-      const capAmt = Math.min(cfg.points.maxLoan, tier ? cfg.points.individualLoanCap : Infinity);
+      const capAmt = Math.min(cfg.credit.maxAmount, cfg.points.maxLoan, tier ? cfg.points.individualLoanCap : Infinity);
       pts.push({ m: d, loan: Math.min(capAmt, limit), need: Math.min(persona.need, capAmt) });
     }
     return pts;
@@ -84,6 +89,7 @@ export default function PersonaPage() {
         <p className="text-sm text-slate-500">یک مشتری را انتخاب یا بسازید و ببینید محصول با او چگونه رفتار می‌کند — همراه با توضیح‌پذیری کامل تصمیم اعتباری.</p>
       </div>
 
+      {storageError && <p role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">{storageError}</p>}
       <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {PERSONAS.map((p) => (
           <button
@@ -94,7 +100,7 @@ export default function PersonaPage() {
           >
             <div className="text-3xl">{p.avatar}</div>
             <div className="mt-1 font-bold">{p.name}</div>
-            <div className="text-[11px] leading-5 text-slate-500">{p.story}</div>
+            <div className="text-[11px] leading-5 text-slate-600">{p.story}</div>
           </button>
         ))}
       </div>
@@ -102,7 +108,7 @@ export default function PersonaPage() {
       <div className="grid gap-5 lg:grid-cols-12">
         <div className="space-y-4 lg:col-span-4">
           <Card title="محصول" icon="🏦">
-            <Select<string> label="انتخاب محصول" value={choice} onChange={setChoice} options={productOptions} />
+            <Select<string> label="انتخاب محصول" value={choice} onChange={(v) => { choiceTouched.current = true; setChoice(v); }} options={productOptions} />
           </Card>
           <Card title={`پرونده ${persona.name}`} icon={persona.avatar}>
             <div className="space-y-3">
@@ -218,7 +224,7 @@ export default function PersonaPage() {
 
               {analysis.sched && uw.eligible && (
                 <Card title="جدول اقساط شخصی‌سازی‌شده" icon="📅" subtitle={`جمع پرداختی: ${mt(analysis.sched.total, 1)} • ${fmt(analysis.sched.months)} قسط`}>
-                  <div className="max-h-72 overflow-y-auto">
+                  <div className="max-h-72 overflow-y-auto" tabIndex={0} role="region" aria-label="جدول اقساط مشتری">
                     <table className="w-full text-xs">
                       <thead className="sticky top-0 bg-white">
                         <tr className="border-b text-slate-500">

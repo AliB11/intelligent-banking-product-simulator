@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useId, useState, type InputHTMLAttributes, type ReactNode } from "react";
 import { fmt } from "@/lib/format";
 
 export function Card({
@@ -19,7 +19,7 @@ export function Card({
   className?: string;
 }) {
   return (
-    <section className={`rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-sm backdrop-blur ${className}`}>
+    <section className={`min-w-0 rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-sm backdrop-blur ${className}`}>
       {(title || actions) && (
         <div className="mb-3 flex items-start justify-between gap-2">
           <div>
@@ -74,17 +74,38 @@ export function Badge({ tone = "slate", children }: { tone?: keyof typeof BADGES
   return <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${BADGES[tone]}`}>{children}</span>;
 }
 
-export function Num({
-  label,
-  value,
-  onChange,
-  min,
-  max,
-  step = 1,
-  unit,
-  hint,
-  warn,
-}: {
+/** Keep an editable draft; only finite in-range values reach financial state, and clamp on blur. */
+export function NumericInput({ value, onChange, min, max, step = 1, ...props }: Omit<InputHTMLAttributes<HTMLInputElement>, "type" | "value" | "min" | "max" | "step" | "onChange"> & {
+  value: number;
+  onChange: (v: number) => void;
+  min: number;
+  max: number;
+  step?: number;
+}) {
+  const safe = Number.isFinite(value) ? value : min;
+  const [draft, setDraft] = useState<string | null>(null);
+  const invalid = draft !== null && (draft === "" || !Number.isFinite(Number(draft)) || Number(draft) < min || Number(draft) > max);
+  return <input
+    {...props}
+    type="number" min={min} max={max} step={step}
+    value={draft ?? safe}
+    aria-invalid={invalid || undefined}
+    onChange={(e) => {
+      const raw = e.target.value;
+      const n = e.target.valueAsNumber;
+      setDraft(raw);
+      if (raw !== "" && Number.isFinite(n) && n >= min && n <= max) onChange(n);
+    }}
+    onBlur={(e) => {
+      const n = e.target.valueAsNumber;
+      if (Number.isFinite(n)) onChange(Math.min(max, Math.max(min, n)));
+      setDraft(null);
+      props.onBlur?.(e);
+    }}
+  />;
+}
+
+export function Num({ label, value, onChange, min, max, step = 1, unit, hint, warn }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
@@ -95,35 +116,29 @@ export function Num({
   hint?: ReactNode;
   warn?: boolean;
 }) {
-  const safe = Number.isFinite(value) ? value : 0;
+  const id = useId();
+  const safe = Number.isFinite(value) ? value : min;
   return (
-    <label className="block">
+    <div className="min-w-0">
       <div className="mb-1 flex items-center justify-between gap-2 text-xs">
-        <span className="font-medium text-slate-700">{label}</span>
+        <label htmlFor={`${id}-number`} className="font-medium text-slate-700">{label}</label>
         <span className="flex items-center gap-1">
-          <input
-            type="number"
-            value={safe}
-            min={min}
-            max={max}
-            step={step}
-            onChange={(e) => onChange(Number(e.target.value))}
+          <NumericInput
+            id={`${id}-number`} value={safe} min={min} max={max} step={step} onChange={onChange}
+            aria-describedby={hint ? `${id}-hint` : undefined}
             className={`ltr w-20 rounded-md border px-1.5 py-0.5 text-left text-xs ${warn ? "border-rose-300 bg-rose-50" : "border-slate-200"}`}
           />
-          {unit && <span className="text-[11px] text-slate-400">{unit}</span>}
+          {unit && <span className="text-[11px] text-slate-500">{unit}</span>}
         </span>
       </div>
       <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={Math.min(max, Math.max(min, safe))}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full"
+        type="range" aria-label={`${label} (نوار تنظیم)`}
+        aria-describedby={hint ? `${id}-hint` : undefined}
+        min={min} max={max} step={step} value={Math.min(max, Math.max(min, safe))}
+        onChange={(e) => onChange(Number(e.target.value))} className="w-full"
       />
-      {hint && <div className={`mt-0.5 text-[11px] leading-4 ${warn ? "text-rose-600" : "text-slate-400"}`}>{hint}</div>}
-    </label>
+      {hint && <div id={`${id}-hint`} className={`mt-0.5 text-[11px] leading-4 ${warn ? "text-rose-600" : "text-slate-500"}`}>{hint}</div>}
+    </div>
   );
 }
 

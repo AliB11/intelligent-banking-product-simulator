@@ -77,9 +77,16 @@ export function checkCompliance(cfg: ProductConfig): ComplianceReport {
     const qard = cfg.contract === "qard";
     const tiered = pt.mode === "tiered_murabaha" && pt.tiers.length > 0;
     if (!qard) add("pts_contract", "info", "عقد وام امتیازی", `وام امتیازی بر پایه «${ct.label}» است؛ سقف نرخ عقود مبادله‌ای (۲۳٪) به‌جای سقف کارمزد قرض‌الحسنه اعمال می‌شود.`, "مصوبه شورای پول و اعتبار");
+    if (pt.mode === "tiered_murabaha" && cfg.contract !== "murabaha") {
+      add("pts_mode_contract", "fail", "ناسازگاری عقد و منوی پله‌ای", "منوی tiered_murabaha نرخ سود مرابحه دارد؛ نباید با عقد قرض‌الحسنه یا عقد دیگری اجرا شود.", "سازگاری ساختار مدل");
+    }
+    if (pt.mode === "tiered_murabaha" && !pt.tiers.length) {
+      add("pts_empty_tiers", "fail", "منوی پله‌ای خالی", "برای حالت چندپله‌ای دست‌کم یک پله تعریف کنید؛ مدل بدون آن به حالت ساده برمی‌گردد.", "سازگاری ساختار مدل");
+    }
     if (qard) {
-      if (pt.loanFee > CBI.qardFeeCap) add("pts_fee", "fail", "کارمزد وام امتیازی", `کارمزد ${fa(pt.loanFee)}٪ از سقف ۴٪ بیشتر است.`, "ضوابط قرض‌الحسنه");
-      else add("pts_fee", "pass", "کارمزد وام امتیازی", `کارمزد ${fa(pt.loanFee)}٪ (حداکثر ۴٪).`, "ضوابط قرض‌الحسنه");
+      const actualFee = tiered ? Math.max(...pt.tiers.map((t) => t.rate)) : pt.loanFee;
+      if (actualFee > CBI.qardFeeCap) add("pts_fee", "fail", "کارمزد وام امتیازی", `کارمزد واقعی ${fa(actualFee)}٪ از سقف ۴٪ بیشتر است.`, "ضوابط قرض‌الحسنه");
+      else add("pts_fee", "pass", "کارمزد وام امتیازی", `کارمزد ${fa(actualFee)}٪ (حداکثر ۴٪).`, "ضوابط قرض‌الحسنه");
     } else {
       const rates = tiered ? pt.tiers.map((t) => t.rate) : [cr.rate];
       const top = Math.max(...rates);
@@ -93,7 +100,7 @@ export function checkCompliance(cfg: ProductConfig): ComplianceReport {
     }
     if (tiered) {
       const bad = pt.tiers.filter((t) => t.waitingMonths < 1 || t.repaymentMonths < 1 || t.loanToAvgDepositPct <= 0);
-      if (bad.length) add("pts_tiers", "warn", "پله‌های نامعتبر", `${fa(bad.length, 0)} پله با انتظار/دوره/ضریب صفر تعریف شده است.`, "طراحی محصول");
+      if (bad.length) add("pts_tiers", "warn", "پله‌های نیازمند بازبینی", `${fa(bad.length, 0)} پله با انتظار/دوره/ضریب صفر تعریف شده است.`, "طراحی محصول");
       const share = pt.tiers.reduce((a, t) => a + t.expectedTakeUpShare, 0);
       if (Math.abs(share - 100) > 1) add("pts_share", "info", "جمع سهم انتخاب پله‌ها", `جمع سهم‌ها ${fa(share, 0)}٪ است؛ مدل آن را به ۱۰۰٪ نرمال می‌کند.`, "طراحی محصول");
     }
@@ -165,10 +172,14 @@ export function generateInsights(cfg: ProductConfig, sim: SimResult, comp: Compl
     } else if (isLoyalty) {
       out.push({ id: "loy_loss", level: "critical", title: "بازده منفی باشگاه وفاداری", body: `هزینه پاداش ${fa(kp.rewardCost, 0)} میلیارد از درآمد افزایشی ${fa(kp.incrementalRevenue, 0)} میلیارد بیشتر است. ارزش امتیاز را کاهش یا سهم شرکا را افزایش دهید.`, action: { label: "ارزش امتیاز −۲۵٪، سهم شرکا ۴۵٪", patch: { loyalty: { pointValue: Math.max(5, Math.round(cfg.loyalty.pointValue * 0.75)), partnerShare: Math.max(45, cfg.loyalty.partnerShare) } } } });
     }
-  } else if (kp.raroc >= cfg.funding.targetRoe && isCredit) {
+  } else if (kp.raroc !== null && kp.raroc >= cfg.funding.targetRoe && isCredit) {
     out.push({ id: "value", level: "positive", title: "محصول ارزش‌آفرین است", body: `بازده تعدیل‌شده با ریسک (RAROC) ${fa(kp.raroc)}٪ از نرخ هدف ${fa(cfg.funding.targetRoe, 0)}٪ بالاتر است؛ سود خالص ${fa(kp.netProfit, 0)} میلیارد تومان.` });
-  } else if (isCredit && kp.raroc < cfg.funding.targetRoe && kp.netProfit >= 0) {
+  } else if (isCredit && kp.raroc !== null && kp.raroc < cfg.funding.targetRoe && kp.netProfit >= 0) {
     out.push({ id: "below_hurdle", level: "warning", title: "سودآور اما زیر نرخ هدف سرمایه", body: `RAROC ${fa(kp.raroc)}٪ کمتر از نرخ هدف ${fa(cfg.funding.targetRoe, 0)}٪ است؛ محصول سرمایه را با بازده کافی جبران نمی‌کند.` });
+  }
+
+  if (!isLoyalty && kp.raroc === null) {
+    out.push({ id: "undefined_raroc", level: "warning", title: "RAROC نامعین است", body: "سرمایه اعتباری مبنا صفر است؛ تقسیم سود بر یک عدد مصنوعی بازده معتبر ایجاد نمی‌کند. سود حاصل از منابع ارزان به‌تنهایی اثبات سودآوری اعتباردهی نیست. برای بازده تعدیل‌شده نقدینگی نیز فرض تخصیص سرمایه را جداگانه بررسی کنید." });
   }
 
   // real economics
@@ -212,8 +223,8 @@ export function generateInsights(cfg: ProductConfig, sim: SimResult, comp: Compl
 
   // points specific
   const tieredPts = isPoints && cfg.points.mode === "tiered_murabaha" && cfg.points.tiers.length > 0;
-  if (isPoints && kp.raroc > 0 && kp.rarocCredit < 0) {
-    out.push({ id: "franchise", level: "warning", title: "ارزش طرح فقط از منابع ارزان است", body: `RAROC اعلامی ${fa(kp.raroc, 0)}٪ است، اما بدون ارزش منابع ارزان (FTP) به ${fa(kp.rarocCredit, 0)}٪ می‌رسد؛ با هزینه بافر نقدینگی و سرمایه ریسک نقدینگی ${fa(kp.rarocLiquidity, 0)}٪ می‌شود. سودآوری به ماندگاری سپرده و نرخ FTP وابسته است — سناریوی خروج سپرده را در آزمایشگاه ALM بسنجید.` });
+  if (isPoints && kp.raroc !== null && kp.rarocCredit !== null && kp.raroc > 0 && kp.rarocCredit < 0) {
+    out.push({ id: "franchise", level: "warning", title: "ارزش طرح فقط از منابع ارزان است", body: `RAROC اعلامی ${fa(kp.raroc, 0)}٪ است، اما بدون ارزش منابع ارزان (FTP) به ${fa(kp.rarocCredit, 0)}٪ می‌رسد؛ با هزینه بافر نقدینگی و سرمایه ریسک نقدینگی ${kp.rarocLiquidity === null ? "نامعین" : `${fa(kp.rarocLiquidity, 0)}٪`} می‌شود. سودآوری به ماندگاری سپرده و نرخ FTP وابسته است — سناریوی خروج سپرده را در آزمایشگاه ALM بسنجید.` });
   }
   if (isPoints) {
     // coefficient / minimum-holding knobs do not exist in a tiered menu → only advise them in simple mode
@@ -267,7 +278,7 @@ export function innovationScore(cfg: ProductConfig): number {
 export function computeHealth(cfg: ProductConfig, sim: SimResult, comp: ComplianceReport): Health {
   const kp = sim.kpis;
   const isLoyalty = cfg.kind === "loyalty";
-  const profitability = isLoyalty ? clamp(50 + kp.loyaltyRoi / 3, 0, 100) : clamp(45 + kp.raroc * 0.9, 0, 100);
+  const profitability = isLoyalty ? clamp(50 + kp.loyaltyRoi / 3, 0, 100) : kp.raroc === null ? 0 : clamp(45 + kp.raroc * 0.9, 0, 100);
   const risk = isLoyalty ? 90 : clamp(100 - kp.nplEnd * 7, 0, 100);
   const customer = isLoyalty
     ? clamp(40 + rewardRate(cfg.loyalty.pointsPer100k, cfg.loyalty.pointValue) * 40, 0, 100)
@@ -328,7 +339,7 @@ export function executiveSummary(cfg: ProductConfig, full: FullResult): string[]
   if (isLoyalty) {
     out.push(`«${cfg.name}» در سناریوی «${scen}» حدود ${cnt(k.booked)} عضو جذب می‌کند؛ با هزینه پاداش ${money(k.rewardCost)} و درآمد افزایشی ${money(k.incrementalRevenue)}، سود خالص ${money(k.netProfit)} و بازده ${fa(k.loyaltyRoi, 0)}٪ دارد.`);
   } else {
-    out.push(`«${cfg.name}» در سناریوی «${scen}» از ${cnt(k.applicants)} متقاضی، ${fa(k.approvalRate, 0)}٪ را تأیید و ${money(k.volume)} ${isPoints ? "وام امتیازی" : "اعتبار"} اعطا می‌کند. سود خالص ${money(k.netProfit)} با RAROC ${fa(k.raroc, 0)}٪ و NPL پایدار ${fa(k.nplEnd, 1)}٪ برآورد می‌شود.`);
+    out.push(`«${cfg.name}» در سناریوی «${scen}» از ${cnt(k.applicants)} متقاضی، ${fa(k.approvalRate, 0)}٪ را تأیید و ${money(k.volume)} ${isPoints ? "وام امتیازی" : "اعتبار"} اعطا می‌کند. سود خالص ${money(k.netProfit)} با RAROC ${k.raroc === null ? "نامعین" : `${fa(k.raroc, 0)}٪`} و NPL پایدار ${fa(k.nplEnd, 1)}٪ برآورد می‌شود.`);
     out.push(`نرخ مؤثر برای مشتری ${fa(k.apr, 1)}٪ و نرخ سربه‌سر بانک ${fa(full.sim.pricing.breakEven, 1)}٪ است؛ با تورم ${fa(k.inflation, 0)}٪، سود واقعی ${money(k.realProfit)} و بازده واقعی دارایی ${fa(k.realYield, 1)}٪ خواهد بود.`);
   }
   if (isPoints) {

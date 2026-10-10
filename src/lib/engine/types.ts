@@ -300,19 +300,22 @@ export interface Kpis {
   preTaxProfit: number;
   netProfit: number;
   avgOutstanding: number;
-  roa: number;
-  raroc: number;
+  /** null when no outstanding credit provides a meaningful denominator; not applicable to loyalty. */
+  roa: number | null;
+  /** null when modeled credit capital is zero; not applicable to loyalty. */
+  raroc: number | null;
   /** RAROC excluding the deposit-franchise (FTP) benefit — pure credit economics (points products) */
-  rarocCredit: number;
+  rarocCredit: number | null;
   /** RAROC after the HQLA-buffer cost and with liquidity capital in the denominator (points products) */
-  rarocLiquidity: number;
+  rarocLiquidity: number | null;
   /** cost of holding the HQLA buffer over the horizon (billion toman) */
   liquidityCost: number;
   /** capital held against a stressed deposit run-off (billion toman) */
   liquidityCapital: number;
   economicCapital: number;
   regulatoryCapital: number;
-  nim: number;
+  /** null when no outstanding credit provides a meaningful denominator; not applicable to loyalty. */
+  nim: number | null;
   apr: number;
   npv: number;
   realYield: number;
@@ -453,7 +456,7 @@ export interface StressRow {
   netProfit: number;
   realProfit: number;
   nplEnd: number;
-  raroc: number;
+  raroc: number | null;
   cumDefaultRate: number;
   probLoss: number;
   approvalRate: number;
@@ -472,8 +475,8 @@ export interface OptimizerPoint {
 export interface OptimizerResult {
   objective: Objective;
   evaluations: number;
-  baseline: { score: number; kpis: Kpis };
-  best: { score: number; kpis: Kpis; config: ProductConfig };
+  baseline: { score: number; kpis: Kpis; feasible: boolean };
+  best: { score: number; kpis: Kpis; config: ProductConfig; feasible: boolean };
   changes: { label: string; from: string; to: string }[];
   points: OptimizerPoint[];
   xLabel: string;
@@ -482,7 +485,7 @@ export interface OptimizerResult {
 
 // ===== انواع جدید برای تحلیل ALM / نقدینگی و محصول چندپله‌ای =====
 
-export type AlmEventType = "deposit" | "reserve" | "release" | "pmt" | "loan" | "withdrawal" | "profit" | "interbank" | "provision" | "writeoff";
+export type AlmEventType = "deposit" | "reserve" | "release" | "pmt" | "fee" | "loan" | "withdrawal" | "profit" | "interbank" | "provision" | "writeoff";
 
 export interface AlmFlowEvent {
   type: AlmEventType;
@@ -507,6 +510,8 @@ export interface AlmMonthRow {
   pmtInflow: number;
   principalIn: number;
   incomeIn: number;
+  /** کارمزد تشکیل پرونده در زمان اعطا (میلیارد تومان) */
+  feeInflow: number;
   inflow: number;
   loanOut: number;
   withdrawalOut: number;
@@ -572,6 +577,7 @@ export interface AlmKpis {
   endCum: number;
   totalPmtInHorizon: number;
   totalIncomeInHorizon: number;
+  totalFeeIncome: number;
   pmtBeyondHorizon: number;
   interbankCost: number;
   /** جمع درآمد سرمایه‌گذاری مازاد نقد در افق (میلیارد تومان) */

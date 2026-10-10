@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import { bannerColor } from "@/lib/color";
 import AlmLab from "@/components/AlmLab";
 import { BarsChart, ComboChart, DnaRadar, Funnel, ParetoChart, Tornado, Waterfall } from "@/components/charts";
 import { Badge, Btn, Card, COMP_LEVEL, Gauge, LEVEL, Meter, Num, Select, Spinner, Stat, Tabs } from "@/components/ui";
@@ -50,18 +51,22 @@ async function post<T>(url: string, body: unknown): Promise<T> {
 export default function Lab({
   productId,
   config,
+  configVersion,
   initial,
   history: initialHistory,
   almLatest = null,
 }: {
   productId: number;
   config: ProductConfig;
+  configVersion: number;
   initial: FullResult | null;
   history: HistItem[];
   almLatest?: { id: number; createdAt: string; summary: Record<string, unknown>; result: FullAlmResult } | null;
 }) {
   const router = useRouter();
   const [cfg, setCfg] = useState<ProductConfig>(config);
+  const [cfgVersion, setCfgVersion] = useState(configVersion);
+  const [almSnapshot, setAlmSnapshot] = useState(almLatest);
   const [params, setParams] = useState<UiParams>(() => initial ? {
     ...DEFAULT_UI_PARAMS,
     ...initial.sim.params,
@@ -78,22 +83,40 @@ export default function Lab({
   const [objective, setObjective] = useState<Objective>("balanced");
   const [history, setHistory] = useState<HistItem[]>(initialHistory);
   const started = useRef(false);
+  const analysisGeneration = useRef(0);
 
   const isPoints = cfg.kind === "points_loan";
   const isLoyalty = cfg.kind === "loyalty";
-  const setP = <K extends keyof UiParams>(k: K, v: UiParams[K]) => setParams((p) => ({ ...p, [k]: v }));
+  const invalidateAnalyses = () => {
+    analysisGeneration.current++;
+    setStress(null); setSens(null); setOpt(null);
+  };
+  const setP = <K extends keyof UiParams>(k: K, v: UiParams[K]) => {
+    setParams((p) => ({ ...p, [k]: v }));
+    invalidateAnalyses();
+  };
 
   const runSim = async () => {
     setLoading("sim");
     setError(null);
     try {
-      const j = await post<FullResult & { simulationId: number | null }>("/api/simulate", { productId, params });
+      const j = await post<FullResult & { config: ProductConfig; configVersion: number; simulationId: number | null }>("/api/simulate", { productId, params });
+      if (JSON.stringify(j.config) !== JSON.stringify(cfg)) {
+        setCfg(j.config);
+        invalidateAnalyses();
+        setAlmSnapshot(null);
+      }
+      setCfgVersion(j.configVersion);
       setResult(j);
+      setParams((current) => current === params ? {
+        ...DEFAULT_UI_PARAMS, ...j.sim.params,
+        marketSize: j.sim.params.customers * j.sim.params.scale, inflation: j.sim.params.inflation ?? null,
+      } : current);
       setHistory((h) => [
         {
           id: j.simulationId ?? Date.now(),
           type: "monte_carlo",
-          scenario: params.scenario,
+          scenario: j.sim.params.scenario,
           summary: { netProfit: j.sim.kpis.netProfit, raroc: j.sim.kpis.raroc, nplEnd: j.sim.kpis.nplEnd, health: j.health.score, grade: j.health.grade },
           createdAt: new Date().toISOString(),
         },
@@ -115,9 +138,15 @@ export default function Lab({
   }, []);
 
   const saveConfig = async (next: ProductConfig) => {
-    const r = await fetch(`/api/products/${productId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ config: next }) });
-    if (!r.ok) throw new Error("ذخیره پیکربندی ناموفق بود");
-    setCfg(next);
+    const r = await fetch(`/api/products/${productId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ config: next, configVersion: cfgVersion }) });
+    const j = await r.json() as { config: ProductConfig; configVersion: number; error?: string };
+    if (!r.ok) throw new Error(j.error ?? "ذخیره پیکربندی ناموفق بود");
+    setCfg(j.config);
+    setCfgVersion(j.configVersion);
+    // A successful edit invalidates every old result, even if the next simulation fails.
+    setResult(null);
+    invalidateAnalyses();
+    setAlmSnapshot(null);
   };
 
   const applyPatch = async (patch: DeepPartial<ProductConfig>) => {
@@ -136,21 +165,32 @@ export default function Lab({
   };
 
   const runAnalysis = async (mode: "stress" | "sensitivity" | "optimize") => {
+    const generation = analysisGeneration.current;
     setLoading(mode);
     setError(null);
     try {
-      if (mode === "stress") setStress((await post<{ rows: StressRow[] }>("/api/analyze", { productId, mode, params })).rows);
-      else if (mode === "sensitivity") setSens((await post<{ items: TornadoItem[] }>("/api/analyze", { productId, mode, params })).items);
-      else setOpt(await post<OptimizerResult>("/api/analyze", { productId, mode, objective, params }));
+      type ResponseConfig = { config: ProductConfig; configVersion: number };
+      const response = mode === "stress"
+        ? await post<ResponseConfig & { rows: StressRow[] }>("/api/analyze", { productId, mode, params })
+        : mode === "sensitivity"
+          ? await post<ResponseConfig & { items: TornadoItem[] }>("/api/analyze", { productId, mode, params })
+          : await post<ResponseConfig & OptimizerResult>("/api/analyze", { productId, mode, objective, params });
+      // Inputs can change while the request is in flight. Never revive an invalidated analysis.
+      if (generation !== analysisGeneration.current) return;
+      if (cfgVersion !== response.configVersion || JSON.stringify(cfg) !== JSON.stringify(response.config)) {
+        setCfg(response.config); setCfgVersion(response.configVersion);
+        setResult(null); invalidateAnalyses(); setAlmSnapshot(null);
+      }
+      if ("rows" in response) setStress(response.rows);
+      else if ("items" in response) setSens(response.items);
+      else setOpt(response);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(null);
-    }
+    } finally { setLoading(null); }
   };
 
   const applyOptimized = async () => {
-    if (!opt) return;
+    if (!opt?.best.feasible) return;
     setLoading("apply");
     try {
       await saveConfig(opt.best.config);
@@ -217,13 +257,13 @@ export default function Lab({
   return (
     <div className="space-y-5">
       {/* header */}
-      <div className="relative overflow-hidden rounded-3xl p-5 text-white shadow-xl" style={{ background: `linear-gradient(120deg, ${cfg.color}, #0f172a 75%)` }}>
+      <div className="relative overflow-hidden rounded-3xl p-5 text-white shadow-xl" style={{ background: `linear-gradient(120deg, ${bannerColor(cfg.color)}, #0f172a 75%)` }}>
         <div className="hero-grid absolute inset-0 opacity-40" />
         <div className="relative flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-4">
             <span className="floaty grid h-16 w-16 place-items-center rounded-2xl bg-white/15 text-4xl">{cfg.emoji}</span>
             <div>
-              <div className="text-2xl font-black">{cfg.name}</div>
+              <h1 className="text-2xl font-black">{cfg.name}</h1>
               <div className="text-sm text-white/80">{cfg.tagline}</div>
               <div className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
                 <span className="rounded-full bg-white/15 px-2 py-0.5">{FAMILIES[cfg.family].emoji} {FAMILIES[cfg.family].label}</span>
@@ -251,15 +291,15 @@ export default function Lab({
       <Card title="پارامترهای شبیه‌سازی مونت‌کارلو" icon="🎛️" subtitle="جمعیت مصنوعی با توزیع درآمد، اشتغال، رتبه اعتباری و رفتار مشتری ایرانی؛ هر اجرا با یک شوک سیستماتیک (واسیچک) متفاوت">
         <div className="grid items-end gap-4 md:grid-cols-3 lg:grid-cols-7">
           <Select<ScenarioId> label="سناریوی کلان" value={params.scenario} onChange={(v) => setP("scenario", v)} options={(Object.keys(SCENARIOS) as ScenarioId[]).map((s) => ({ value: s, label: `${SCENARIOS[s].label} (تورم ${fmt(SCENARIOS[s].inflation)}٪)` }))} />
-          <Num label="مشتریان مصنوعی" value={params.customers} onChange={(v) => setP("customers", v)} min={1000} max={10000} step={500} />
-          <Num label="تعداد اجرا" value={params.runs} onChange={(v) => setP("runs", v)} min={4} max={60} step={1} />
+          <Num label="مشتریان مصنوعی" value={params.customers} onChange={(v) => setP("customers", v)} min={500} max={10000} step={500} />
+          <Num label="تعداد اجرا" value={params.runs} onChange={(v) => setP("runs", v)} min={1} max={60} step={1} />
           <Num label="افق (ماه)" value={params.horizon} onChange={(v) => setP("horizon", v)} min={12} max={60} step={6} />
-          <Num label="نرخ مؤثر رقبا" value={params.marketRate} onChange={(v) => setP("marketRate", v)} min={15} max={40} step={0.5} unit="٪" />
+          <Num label="نرخ مؤثر رقبا" value={params.marketRate} onChange={(v) => setP("marketRate", v)} min={5} max={60} step={0.5} unit="٪" />
           <Select<string>
             label="اندازه بازار هدف"
             value={String(params.marketSize)}
             onChange={(v) => setP("marketSize", Number(v))}
-            options={[250000, 500000, 1000000, 3000000, 10000000].map((n) => ({ value: String(n), label: `${count(n)} نفر` }))}
+            options={[...new Set([250000, 500000, 1000000, 3000000, 10000000, params.marketSize])].sort((a, b) => a - b).map((n) => ({ value: String(n), label: `${count(n)} نفر` }))}
           />
           <Btn onClick={runSim} disabled={!!loading} className="h-10">
             {loading === "sim" || loading === "apply" ? <Spinner /> : "▶"} اجرای شبیه‌سازی
@@ -312,7 +352,7 @@ export default function Lab({
             {isLoyalty ? (
               <Stat label="بازده باشگاه (ROI)" value={pct(kp.loyaltyRoi, 0)} tone={kp.loyaltyRoi >= 0 ? "good" : "bad"} icon="🎯" />
             ) : (
-              <Stat label="RAROC سالانه" value={pct(kp.raroc, 1)} tone={kp.raroc >= cfg.funding.targetRoe ? "good" : kp.raroc >= 0 ? "warn" : "bad"} sub={`هدف ${fmt(cfg.funding.targetRoe)}٪`} icon="📐" />
+              <Stat label="RAROC سالانه" value={pct(kp.raroc, 1)} tone={kp.raroc === null ? "neutral" : kp.raroc >= cfg.funding.targetRoe ? "good" : kp.raroc >= 0 ? "warn" : "bad"} sub={kp.raroc === null ? "بدون سرمایه مبنای معتبر" : `هدف ${fmt(cfg.funding.targetRoe)}٪`} icon="📐" />
             )}
             {isLoyalty ? (
               <Stat label="اعضای جذب‌شده" value={count(kp.booked)} icon="👥" />
@@ -322,7 +362,7 @@ export default function Lab({
             {!isLoyalty && <Stat label="NPL (پایدار)" value={pct(kp.nplEnd)} tone={kp.nplEnd > 8 ? "bad" : kp.nplEnd > 5 ? "warn" : "good"} icon="🚨" />}
             {!isLoyalty && <Stat label="نرخ تأیید" value={pct(kp.approvalRate, 0)} sub={`${count(kp.applicants)} متقاضی`} icon="✅" />}
             {!isLoyalty && <Stat label="نرخ مؤثر مشتری (APR)" value={pct(kp.apr)} icon="🏷️" />}
-            {!isLoyalty && <Stat label="ROA سالانه" value={pct(kp.roa)} tone={kp.roa >= 0 ? "good" : "bad"} icon="📈" />}
+            {!isLoyalty && <Stat label="ROA سالانه" value={pct(kp.roa)} tone={kp.roa === null ? "neutral" : kp.roa >= 0 ? "good" : "bad"} icon="📈" />}
             {!isLoyalty && <Stat label="حاشیه سود خالص (NIM)" value={pct(kp.nim)} icon="➗" />}
             {!isLoyalty && <Stat label="PD / LGD متوسط" value={`${pct(kp.avgPd)} / ${pct(kp.avgLgd, 0)}`} icon="🎲" />}
             {!isLoyalty && <Stat label="نکول تجمعی" value={pct(kp.cumDefaultRate)} icon="⚠️" />}
@@ -337,8 +377,8 @@ export default function Lab({
               <>
                 <Stat label="میانگین سپرده امتیازی" value={money(kp.depositsAvg)} icon="🐷" />
                 <Stat label="ارزش منابع ارزان" value={money(kp.fundingBenefit)} tone="good" icon="💎" />
-                <Stat label="RAROC فقط اعتباری" value={pct(kp.rarocCredit, 0)} tone={kp.rarocCredit >= 0 ? "neutral" : "bad"} sub="بدون ارزش منابع ارزان" icon="🧮" />
-                <Stat label="RAROC تعدیل‌شده نقدینگی" value={pct(kp.rarocLiquidity, 0)} tone={kp.rarocLiquidity >= cfg.funding.targetRoe ? "good" : "warn"} sub={`بافر ${money(kp.liquidityCost)} • سرمایه ${money(kp.liquidityCapital)}`} icon="💧" />
+                <Stat label="RAROC فقط اعتباری" value={pct(kp.rarocCredit, 0)} tone={kp.rarocCredit === null || kp.rarocCredit >= 0 ? "neutral" : "bad"} sub="بدون ارزش منابع ارزان" icon="🧮" />
+                <Stat label="RAROC تعدیل‌شده نقدینگی" value={pct(kp.rarocLiquidity, 0)} tone={kp.rarocLiquidity === null ? "neutral" : kp.rarocLiquidity >= cfg.funding.targetRoe ? "good" : "warn"} sub={`بافر ${money(kp.liquidityCost)} • سرمایه ${money(kp.liquidityCapital)}`} icon="💧" />
                 <Stat label="تراز پول–زمان (عمر)" value={fmt(kp.moneyTimeRatio, 2)} tone={kp.moneyTimeRatio >= 1 ? "good" : "bad"} sub="سپرده‌ماه ÷ وام‌ماه" icon="⏱️" />
                 <Stat label="انتظار برای امتیاز" value={`${fmt(kp.avgWaitDays)} روز`} icon="⌛" />
               </>
@@ -537,7 +577,7 @@ export default function Lab({
             )}
           </Card>
           <Card className="lg:col-span-7" title="جدول قیمت‌گذاری به تفکیک رتبه اعتباری" icon="📋" subtitle="کدام رتبه‌ها با نرخ فعلی و سقف ۲۳٪ سودآورند؟">
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="جدول قیمت‌گذاری اعتباری">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b text-slate-500">
@@ -589,7 +629,7 @@ export default function Lab({
                 <BarsChart data={stress} xKey="label" yFmt={axisMoney} series={[{ key: "netProfit", label: "سود خالص (میلیارد تومان)", color: "#6366f1" }]} colorBy={(r) => String(r.color)} />
                 <BarsChart data={stress} xKey="label" yFmt={(v) => `${fmt(v, 1)}٪`} series={[{ key: "nplEnd", label: "NPL٪", color: "#ef4444" }]} colorBy={(r) => String(r.color)} />
               </div>
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="جدول سناریوهای استرس">
                 <table className="w-full text-xs">
                   <thead>
                     <tr className="border-b text-slate-500">
@@ -649,7 +689,7 @@ export default function Lab({
           <Card title="بهینه‌ساز هوشمند محصول" icon="🧠" subtitle="جستجوی تصادفی + جستجوی محلی نخبه‌گرا در فضای پارامترها با قید انطباق مقرراتی؛ مرز پارتو بین دسترسی و سود را کشف می‌کند.">
             <div className="flex flex-wrap items-end gap-3">
               <div className="min-w-64">
-                <Select<Objective> label="هدف بهینه‌سازی" value={objective} onChange={setObjective} options={OBJECTIVES} />
+                <Select<Objective> label="هدف بهینه‌سازی" value={objective} onChange={(v) => { setObjective(v); invalidateAnalyses(); }} options={OBJECTIVES} />
               </div>
               <Btn onClick={() => runAnalysis("optimize")} disabled={!!loading}>
                 {loading === "optimize" ? <Spinner /> : "🧠"} اجرای بهینه‌ساز
@@ -658,7 +698,7 @@ export default function Lab({
           </Card>
           {opt && (
             <div className="grid gap-4 lg:grid-cols-12">
-              <Card className="lg:col-span-5" title="پیکربندی پیشنهادی" icon="🏆" subtitle={`${fmt(opt.evaluations)} پیکربندی ارزیابی شد`}>
+              {opt.best.feasible ? <Card className="lg:col-span-5" title="پیکربندی پیشنهادی" icon="🏆" subtitle={`${fmt(opt.evaluations)} پیکربندی ارزیابی شد؛ انطباق بر مقدار هدف اولویت دارد و ممکن است سود کمتر شود.`}>
                 <div className="grid grid-cols-2 gap-2">
                   <Stat label="سود خالص: فعلی ← بهینه" value={<span className="text-base">{money(opt.baseline.kpis.netProfit)} ← {money(opt.best.kpis.netProfit)}</span>} tone={opt.best.kpis.netProfit >= opt.baseline.kpis.netProfit ? "good" : "warn"} />
                   <Stat label={isLoyalty ? "ROI" : "RAROC"} value={<span className="text-base">{pct(isLoyalty ? opt.baseline.kpis.loyaltyRoi : opt.baseline.kpis.raroc, 0)} ← {pct(isLoyalty ? opt.best.kpis.loyaltyRoi : opt.best.kpis.raroc, 0)}</span>} />
@@ -685,7 +725,9 @@ export default function Lab({
                     {loading === "apply" ? <Spinner /> : "✅"} اعمال پیکربندی بهینه و شبیه‌سازی مجدد
                   </Btn>
                 )}
-              </Card>
+              </Card> : <Card className="lg:col-span-5" title="طراحی امکان‌پذیر پیدا نشد" icon="⚠️">
+                <p role="status" className="text-sm text-amber-800">در فضای جستجوی بررسی‌شده، طرحی با انطباق قابل قبول و شاخص هدف قابل محاسبه پیدا نشد. این نتیجه به معنی بهینه‌بودن یا آماده‌عرضه‌بودن پیکربندی فعلی نیست؛ قیود و مبنای شاخص را بازبینی کنید.</p>
+              </Card>}
               <Card className="lg:col-span-7" title="فضای جستجو و مرز کارای پارتو" icon="🗺️" subtitle="هر نقطه یک طراحی آزموده‌شده است؛ نقاط سبز هیچ طراحی دیگری بر آن‌ها غلبه نمی‌کند.">
                 <ParetoChart points={opt.points} xLabel={opt.xLabel} yLabel={opt.yLabel} />
               </Card>
@@ -708,14 +750,24 @@ export default function Lab({
         </Card>
       )}
 
-      {tab === "alm" && isPoints && (
+      {isPoints && (
         <AlmLab
+          key={cfgVersion}
+          active={tab === "alm"}
           productId={productId}
           cfg={cfg}
           history={history}
           busy={!!loading}
-          latest={almLatest}
-          onSaved={(item) => setHistory((h) => [item, ...h])}
+          latest={almSnapshot}
+          onSaved={(item, full, analyzedConfig, version) => {
+            setHistory((h) => [item, ...h]);
+            setAlmSnapshot({ id: item.id, createdAt: item.createdAt, summary: item.summary, result: full });
+            if ((version !== undefined && cfgVersion !== version) || JSON.stringify(cfg) !== JSON.stringify(analyzedConfig)) {
+              setCfg(analyzedConfig);
+              setResult(null); invalidateAnalyses();
+            }
+            if (version !== undefined) setCfgVersion(version);
+          }}
           onApplyTiers={(tiers) => applyPatch({ points: { tiers } })}
         />
       )}
@@ -725,7 +777,7 @@ export default function Lab({
           {history.length === 0 ? (
             <div className="py-8 text-center text-sm text-slate-500">هنوز تحلیلی ثبت نشده است.</div>
           ) : (
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="تاریخچه تحلیل‌ها">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b text-slate-500">
@@ -765,7 +817,7 @@ export default function Lab({
 
 function SegTable({ rows }: { rows: { key: string; label: string; applicants: number; approved: number; approvalRate: number; avgPd: number; volume: number }[] }) {
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto" tabIndex={0} role="region" aria-label="جدول داده‌های تحلیل">
       <table className="w-full text-xs">
         <thead>
           <tr className="border-b text-slate-500">
