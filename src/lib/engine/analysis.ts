@@ -139,17 +139,21 @@ export function runSensitivity(cfg: ProductConfig, base: SimParams): TornadoItem
   const items: TornadoItem[] = vars.map((v) => {
     const [lc, lp] = v.apply(cfg, fast, -1);
     const [hc, hp] = v.apply(cfg, fast, 1);
+    const low = simulatePortfolio(lc, lp).kpis.netProfit;
+    const high = simulatePortfolio(hc, hp).kpis.netProfit;
+    const swing = Math.max(low, high, baseProfit) - Math.min(low, high, baseProfit);
     return {
       key: v.key,
       label: v.label,
       lowLabel: v.lowLabel,
       highLabel: v.highLabel,
-      low: simulatePortfolio(lc, lp).kpis.netProfit,
-      high: simulatePortfolio(hc, hp).kpis.netProfit,
+      low,
+      high,
       base: baseProfit,
+      swing,
     };
   });
-  return items.sort((a, b) => Math.abs(b.high - b.low) - Math.abs(a.high - a.low));
+  return items.sort((a, b) => b.swing - a.swing);
 }
 
 // ======================= Smart optimizer =======================
