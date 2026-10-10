@@ -1,9 +1,16 @@
 import { NextResponse } from "next/server";
-import { runFullAlmAnalysis } from "@/lib/engine/alm";
+import { runFullAlmAnalysis, type FullAlmParams } from "@/lib/engine/alm";
 import { templateConfig, normalizeConfig } from "@/lib/engine/templates";
 import type { ProductConfig } from "@/lib/engine/types";
 
 export const runtime = "nodejs";
+
+type AlmScenario = NonNullable<FullAlmParams["scenario"]>;
+const ALM_SCENARIOS: readonly AlmScenario[] = ["base", "stress", "fast_growth"];
+
+function parseScenario(value: unknown): AlmScenario {
+  return ALM_SCENARIOS.includes(value as AlmScenario) ? (value as AlmScenario) : "base";
+}
 
 export async function POST(req: Request) {
   try {
@@ -13,14 +20,14 @@ export async function POST(req: Request) {
       templateKey,
       marketShare = 5,
       horizon = 60,
-      scenario = "base",
+      scenario,
       seed,
     } = body as {
       product?: unknown;
       templateKey?: string;
       marketShare?: number;
       horizon?: number;
-      scenario?: string;
+      scenario?: unknown;
       seed?: number;
     };
 
@@ -41,7 +48,7 @@ export async function POST(req: Request) {
       product: cfg,
       marketShare: Math.max(0.1, Math.min(50, Number(marketShare) || 5)),
       horizon: Math.max(12, Math.min(120, Number(horizon) || 60)),
-      scenario,
+      scenario: parseScenario(scenario),
       seed: seed ? Number(seed) : 1405,
     });
 
