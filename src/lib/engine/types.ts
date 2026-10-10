@@ -302,6 +302,14 @@ export interface Kpis {
   avgOutstanding: number;
   roa: number;
   raroc: number;
+  /** RAROC excluding the deposit-franchise (FTP) benefit — pure credit economics (points products) */
+  rarocCredit: number;
+  /** RAROC after the HQLA-buffer cost and with liquidity capital in the denominator (points products) */
+  rarocLiquidity: number;
+  /** cost of holding the HQLA buffer over the horizon (billion toman) */
+  liquidityCost: number;
+  /** capital held against a stressed deposit run-off (billion toman) */
+  liquidityCapital: number;
   economicCapital: number;
   regulatoryCapital: number;
   nim: number;
@@ -629,6 +637,8 @@ export interface AlmAnalysisResult {
     p95: number;
     p99: number;
     worstCaseMaxHole: number;
+    /** نمونه‌های مرتب‌شده حداکثر حفره (برای هیستوگرام) */
+    samples?: number[];
   };
   optimalTierDesign?: {
     tiers: TieredMurabahaTier[];

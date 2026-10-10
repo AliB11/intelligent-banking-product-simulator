@@ -5,7 +5,7 @@ import { products, simulations } from "@/db/schema";
 import { analyzeResult } from "@/lib/engine/advisor";
 import { QUICK_PARAMS, simulatePortfolio } from "@/lib/engine/simulator";
 import { normalizeConfig, SEED_TEMPLATE_KEYS, templateConfig } from "@/lib/engine/templates";
-import type { FullResult, ProductConfig } from "@/lib/engine/types";
+import type { FullAlmResult, FullResult, ProductConfig } from "@/lib/engine/types";
 
 let ready: Promise<void> | null = null;
 
@@ -199,6 +199,19 @@ export async function latestFullResult(productId: number): Promise<FullResult | 
     .orderBy(desc(simulations.createdAt))
     .limit(1);
   return r ? (r.result as FullResult) : null;
+}
+
+/** Latest stored ALM run that was computed on the product's current configuration (compact form). */
+export async function latestAlmResult(productId: number): Promise<{ id: number; createdAt: string; summary: Record<string, unknown>; result: FullAlmResult } | null> {
+  await ensureDb();
+  const [r] = await db
+    .select({ id: simulations.id, createdAt: simulations.createdAt, summary: simulations.summary, result: simulations.result })
+    .from(simulations)
+    .innerJoin(products, eq(products.id, simulations.productId))
+    .where(and(eq(simulations.productId, productId), eq(simulations.type, "alm"), gte(simulations.createdAt, products.updatedAt)))
+    .orderBy(desc(simulations.createdAt))
+    .limit(1);
+  return r ? { id: r.id, createdAt: r.createdAt.toISOString(), summary: r.summary, result: r.result as FullAlmResult } : null;
 }
 
 export function summarize(full: FullResult): Record<string, unknown> {

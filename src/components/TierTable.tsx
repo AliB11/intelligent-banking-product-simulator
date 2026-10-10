@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+import { customerAllInCost, pmtFor } from "@/lib/engine/alm";
 import { CBI } from "@/lib/engine/catalog";
 import { effectiveApr, tierWeights } from "@/lib/engine/math";
 import { MAX_TIERS } from "@/lib/engine/templates";
@@ -25,13 +27,25 @@ export default function TierTable({
   tiers,
   upfrontFee,
   insurance,
+  contract,
+  depositRate,
   onChange,
 }: {
   tiers: TieredMurabahaTier[];
   upfrontFee: number;
   insurance: number;
+  contract: "qard" | "murabaha";
+  depositRate: number;
   onChange: (tiers: TieredMurabahaTier[]) => void;
 }) {
+  const [oppRate, setOppRate] = useState(23);
+  /** all-in annual cost for a customer with a 100M toman average balance (IRR incl. the opportunity cost of waiting) */
+  const allIn = (t: TieredMurabahaTier) => {
+    const loan = t.loanToAvgDepositPct; // α% of 100M = α million
+    const n = Math.max(1, Math.round(t.repaymentMonths));
+    if (loan <= 0) return null;
+    return customerAllInCost(loan, 100, t.waitingMonths, pmtFor(contract, loan, t.rate, n), n, oppRate, depositRate).cost;
+  };
   const weights = tierWeights(tiers);
   const shareSum = tiers.reduce((s, t) => s + t.expectedTakeUpShare, 0);
   const set = (i: number, key: NumKey, raw: string) => {
@@ -61,6 +75,7 @@ export default function TierTable({
                 </th>
               ))}
               <th className="p-2 text-right">APR</th>
+              <th className="p-2 text-right" title="IRR سالانه با احتساب هزینه فرصت انتظار (معدل ۱۰۰ م.ت)">هزینه تمام‌شده</th>
               <th className="p-2 text-right" title="وام به ازای ۱۰۰ میلیون تومان معدل">وام/۱۰۰ م.ت</th>
               <th className="p-2" />
             </tr>
@@ -94,6 +109,14 @@ export default function TierTable({
                     </td>
                   ))}
                   <td className="p-1.5 tabular-nums text-slate-700">{fmt(apr, 1)}٪</td>
+                  {(() => {
+                    const c = allIn(t);
+                    return (
+                      <td className={`p-1.5 font-bold tabular-nums ${c === null ? "text-slate-400" : c > oppRate ? "text-rose-600" : "text-emerald-600"}`} title={c !== null && c > oppRate ? "برای مشتری گران‌تر از نرخ فرصت" : "برای مشتری ارزان‌تر از نرخ فرصت"}>
+                        {c === null ? "—" : c >= 999 ? "> ۹۹۹٪" : `${fmt(c, 1)}٪`}
+                      </td>
+                    );
+                  })()}
                   <td className="p-1.5 tabular-nums text-slate-700">{fmt(t.loanToAvgDepositPct, 0)} م.ت</td>
                   <td className="p-1.5 text-left">
                     <button type="button" className="rounded px-1.5 py-0.5 text-rose-600 hover:bg-rose-50 disabled:opacity-30" onClick={() => remove(i)} disabled={tiers.length <= 1} aria-label={`حذف ${t.name}`}>
@@ -112,6 +135,10 @@ export default function TierTable({
           {Math.abs(shareSum - 100) > 1 && " — در شبیه‌سازی به ۱۰۰٪ نرمال می‌شود"} • میانگین وزنی نرخ:{" "}
           <b className="text-slate-700">{fmt(tiers.reduce((s, t, i) => s + weights[i] * t.rate, 0), 1)}٪</b>
         </span>
+        <label className="flex items-center gap-1">
+          نرخ فرصت مشتری
+          <input aria-label="نرخ فرصت مشتری" type="number" className="w-16 rounded border border-slate-200 px-1.5 py-0.5 tabular-nums" value={oppRate} min={0} max={60} step={0.5} onChange={(e) => Number.isFinite(Number(e.target.value)) && setOppRate(Number(e.target.value))} />٪
+        </label>
         <button type="button" onClick={add} disabled={tiers.length >= MAX_TIERS} className="rounded-lg border border-slate-200 px-2 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40">
           + افزودن پله
         </button>

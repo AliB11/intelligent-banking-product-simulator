@@ -277,7 +277,7 @@ export default function Studio({ initial, productId }: { initial: ProductConfig;
           >
             {tiered && (
               <div className="mb-4">
-                <TierTable tiers={cfg.points.tiers} upfrontFee={cfg.credit.upfrontFee} insurance={cfg.credit.insurance} onChange={(t) => setS("points", "tiers", t)} />
+                <TierTable tiers={cfg.points.tiers} upfrontFee={cfg.credit.upfrontFee} insurance={cfg.credit.insurance} contract={cfg.contract === "qard" ? "qard" : "murabaha"} depositRate={cfg.points.depositRate} onChange={(t) => setS("points", "tiers", t)} />
               </div>
             )}
             <div className="grid gap-4 sm:grid-cols-2">

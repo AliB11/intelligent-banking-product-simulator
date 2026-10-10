@@ -1,4 +1,4 @@
-import { CBI, CHANNELS, COLLATERALS, EMPLOYMENT_LABELS, SCENARIOS, SCORE_BANDS, rewardRate } from "./catalog";
+import { CBI, LIQUIDITY, CHANNELS, COLLATERALS, EMPLOYMENT_LABELS, SCENARIOS, SCORE_BANDS, rewardRate } from "./catalog";
 import {
   aprFor,
   buildSchedule,
@@ -853,6 +853,10 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
   const dist = distribution(runNet);
   const last = series[series.length - 1];
 
+  // Liquidity adjustment (points products): HQLA buffer forgoes FTP; liquidity capital covers a stressed run-off
+  const afterTax = 1 - fnd.taxRate / 100;
+  const liqCost = isPoints ? ((avgDep * LIQUIDITY.bufferRunoff) / 100) * (cofBase / 100) * (H / 12) : 0;
+  const liqCapital = isPoints ? ((avgDep * LIQUIDITY.stressRunoff) / 100) * (LIQUIDITY.stressSpread / 100) : 0;
   const pct = (v: number) => (isLoyalty || avgOut <= 1e-6 ? 0 : ((v * annual) / safeOut) * 100);
   // Hurdle is an after-tax ROE; pricing components are pre-tax → gross up by 1/(1 − tax).
   const grossRoe = fnd.targetRoe / Math.max(0.05, 1 - fnd.taxRate / 100);
@@ -922,6 +926,10 @@ export function simulatePortfolio(cfg: ProductConfig, p: SimParams): SimResult {
     avgOutstanding: avgOut,
     roa: isLoyalty ? 0 : ((netProfit * annual) / safeOut) * 100,
     raroc: isLoyalty ? 0 : ((netProfit * annual) / capital) * 100,
+    rarocCredit: isLoyalty ? 0 : (((netProfit - (isPoints ? benefitT * afterTax : 0)) * annual) / capital) * 100,
+    rarocLiquidity: isLoyalty ? 0 : (((netProfit - liqCost * afterTax) * annual) / (capital + liqCapital)) * 100,
+    liquidityCost: liqCost,
+    liquidityCapital: liqCapital,
     economicCapital: ec,
     regulatoryCapital: rc,
     nim: isLoyalty ? 0 : (((interestIncome + feeIncome + benefitT - fundingCost) * annual) / safeOut) * 100,

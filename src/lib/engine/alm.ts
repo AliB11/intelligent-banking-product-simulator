@@ -808,12 +808,25 @@ export function calcAntiNegin(
 /** بازار هدف سپرده بالقوه: ۵۰ همت = ۵۰٬۰۰۰ میلیارد تومان (فرض آموزشی). */
 export const ALM_MARKET_DEPOSITS_B = 50_000;
 
+export interface AlmDesignerConstraints {
+  /** سقف حفره نقدینگی به‌صورت درصد کل سپرده (پیش‌فرض ۴۰٪) */
+  maxHolePct?: number;
+  /** حداقل حاشیه روی سپرده خالص در افق (٪، پیش‌فرض ۲) */
+  minMarginPct?: number;
+  /** سقف اهرم تعهدات (پیش‌فرض ۲٫۵) */
+  maxLeverage?: number;
+  objective?: "margin" | "liquidity" | "reach";
+}
+
 export interface FullAlmParams {
   product: ProductConfig;
   marketShare: number; // درصد
   horizon: number;
   scenario?: "base" | "stress" | "fast_growth";
   seed?: number;
+  /** نرخ فرصت سپرده‌گذاری مشتری (٪ سالانه، پیش‌فرض ۲۳) — مبنای هزینه تمام‌شده مشتری */
+  opportunityRatePct?: number;
+  designer?: AlmDesignerConstraints;
 }
 
 export function almBaseInput(params: FullAlmParams): AlmSimInput {
@@ -828,7 +841,7 @@ export function almBaseInput(params: FullAlmParams): AlmSimInput {
     runoffRatePct: 85,
     churnRatePct: 40,
     interbankRatePct: 24,
-    opportunityRatePct: 23,
+    opportunityRatePct: clamp(params.opportunityRatePct ?? 23, 0, 100),
     reserveRatioPct: product.funding.reserveRatio,
     seed,
   };
@@ -852,8 +865,12 @@ export function runFullAlmAnalysis(params: FullAlmParams): FullAlmResult {
   const tornado = runAlmTornado(base);
   const stressGrid = runAlmStressGrid(base);
   const mc = runAlmMonteCarlo(base, 300, 50, params.seed);
+  const d = params.designer ?? {};
   const opti = inverseTierDesigner(base, {
-    maxHoleBillion: base.totalDepositBillionToman * 0.4, minMarginPct: 2, maxLeverage: 2.5, targetObjective: "margin",
+    maxHoleBillion: base.totalDepositBillionToman * (clamp(d.maxHolePct ?? 40, 0, 100) / 100),
+    minMarginPct: d.minMarginPct ?? 2,
+    maxLeverage: d.maxLeverage ?? 2.5,
+    targetObjective: d.objective ?? "margin",
   });
   return {
     alm,
@@ -873,5 +890,49 @@ export function mergeAlmKpisIntoCore(almKpis: AlmKpis, baseKpis: Kpis): Kpis {
     fundingCost: almKpis.totalProfitPaid + almKpis.interbankCost,
     fundingBenefit: almKpis.netInterestIncome,
     sourceUseRatio: almKpis.leverage > 0 ? Math.min(RATIO_CAP, 1 / almKpis.leverage) : RATIO_CAP,
+  };
+}
+
+/** خلاصه یک اجرای ALM برای تاریخچه و مقایسه نسخه‌های طراحی (شامل تصویر پله‌ها). */
+export function summarizeAlm(full: FullAlmResult, params: Omit<FullAlmParams, "product">, cfg: ProductConfig): Record<string, unknown> {
+  const k = full.alm.kpis;
+  const mc = full.analysis.monteCarlo;
+  return {
+    maxHole: k.maxHole,
+    holePct: k.totalDeposit > 0 ? (k.maxHole / k.totalDeposit) * 100 : 0,
+    tippingPoint: k.tippingPoint,
+    recoveryMonth: k.recoveryMonth,
+    netMargin: k.netMargin,
+    marginOnNetDeposit: k.marginOnNetDeposit,
+    leverage: k.leverage,
+    minLcr: k.minLcr,
+    nsfrAt12: k.nsfrAt12,
+    totalDeposit: k.totalDeposit,
+    borrowers: k.borrowers,
+    pTipping: mc?.pTipping ?? null,
+    p95Hole: mc?.p95 ?? null,
+    marketShare: params.marketShare,
+    horizon: params.horizon,
+    scenario: params.scenario ?? "base",
+    opportunityRatePct: params.opportunityRatePct ?? 23,
+    tiers: effectiveTiers(cfg).map((t) => ({
+      name: t.name, wait: t.waitingMonths, alpha: t.loanToAvgDepositPct, rate: t.rate, tenor: t.repaymentMonths, share: t.expectedTakeUpShare,
+    })),
+  };
+}
+
+/** نسخه فشرده نتیجه برای ذخیره در پایگاه داده (بدون رویدادهای ماهانه و منوی گزینه‌ها که قابل بازتولیدند). */
+export function compactAlmResult(full: FullAlmResult): FullAlmResult {
+  return {
+    ...full,
+    alm: {
+      ...full.alm,
+      rows: full.alm.rows.map((r) => ({ ...r, events: [] })),
+      customerOptions: [],
+      paretoFrontier: full.alm.paretoFrontier,
+    },
+    analysis: full.analysis.monteCarlo
+      ? { ...full.analysis, monteCarlo: { ...full.analysis.monteCarlo, samples: [] } }
+      : full.analysis,
   };
 }

@@ -3,12 +3,13 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import AlmLab from "@/components/AlmLab";
 import { BarsChart, ComboChart, DnaRadar, Funnel, ParetoChart, Tornado, Waterfall } from "@/components/charts";
 import { Badge, Btn, Card, COMP_LEVEL, Gauge, LEVEL, Meter, Num, Select, Spinner, Stat, Tabs } from "@/components/ui";
 import { CHANNELS, COLLATERALS, CONTRACTS, FAMILIES, KINDS, SCENARIOS } from "@/lib/engine/catalog";
 import { executiveSummary } from "@/lib/engine/advisor";
 import { mergeConfig } from "@/lib/engine/templates";
-import type { DeepPartial, FullResult, Objective, OptimizerResult, ProductConfig, ScenarioId, StressRow, TornadoItem } from "@/lib/engine/types";
+import type { DeepPartial, FullAlmResult, FullResult, Objective, OptimizerResult, ProductConfig, ScenarioId, StressRow, TornadoItem } from "@/lib/engine/types";
 import { axisMoney, count, faDate, fmt, money, mt, pct } from "@/lib/format";
 import { DEFAULT_UI_PARAMS, type UiParams } from "@/lib/params";
 
@@ -20,7 +21,7 @@ interface HistItem {
   createdAt: string;
 }
 
-type TabKey = "results" | "advisor" | "pricing" | "stress" | "sensitivity" | "optimizer" | "compliance" | "history";
+type TabKey = "results" | "advisor" | "pricing" | "stress" | "sensitivity" | "optimizer" | "alm" | "compliance" | "history";
 
 const OBJECTIVES: { value: Objective; label: string }[] = [
   { value: "balanced", label: "⚖️ متوازن (حداکثر امتیاز سلامت)" },
@@ -34,7 +35,10 @@ const TYPE_LABEL: Record<string, string> = {
   stress: "تست استرس",
   sensitivity: "حساسیت",
   optimize: "بهینه‌سازی",
+  alm: "ALM",
 };
+
+const ALM_SCEN_LABEL: Record<string, string> = { stress: "استرس نقدینگی (ALM)", fast_growth: "رشد سریع (ALM)" };
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -43,7 +47,19 @@ async function post<T>(url: string, body: unknown): Promise<T> {
   return j;
 }
 
-export default function Lab({ productId, config, initial, history: initialHistory }: { productId: number; config: ProductConfig; initial: FullResult | null; history: HistItem[] }) {
+export default function Lab({
+  productId,
+  config,
+  initial,
+  history: initialHistory,
+  almLatest = null,
+}: {
+  productId: number;
+  config: ProductConfig;
+  initial: FullResult | null;
+  history: HistItem[];
+  almLatest?: { id: number; createdAt: string; summary: Record<string, unknown>; result: FullAlmResult } | null;
+}) {
   const router = useRouter();
   const [cfg, setCfg] = useState<ProductConfig>(config);
   const [params, setParams] = useState<UiParams>(() => initial ? {
@@ -269,6 +285,7 @@ export default function Lab({ productId, config, initial, history: initialHistor
           { key: "stress", label: "تست استرس", icon: "🌪️" },
           { key: "sensitivity", label: "تحلیل حساسیت", icon: "🌡️" },
           { key: "optimizer", label: "بهینه‌ساز هوشمند", icon: "🧠" },
+          ...(isPoints ? [{ key: "alm" as TabKey, label: "آزمایشگاه ALM", icon: "🌊" }] : []),
           { key: "compliance", label: "انطباق", icon: "⚖️" },
           { key: "history", label: "تاریخچه", icon: "🕘" },
         ]}
@@ -320,6 +337,8 @@ export default function Lab({ productId, config, initial, history: initialHistor
               <>
                 <Stat label="میانگین سپرده امتیازی" value={money(kp.depositsAvg)} icon="🐷" />
                 <Stat label="ارزش منابع ارزان" value={money(kp.fundingBenefit)} tone="good" icon="💎" />
+                <Stat label="RAROC فقط اعتباری" value={pct(kp.rarocCredit, 0)} tone={kp.rarocCredit >= 0 ? "neutral" : "bad"} sub="بدون ارزش منابع ارزان" icon="🧮" />
+                <Stat label="RAROC تعدیل‌شده نقدینگی" value={pct(kp.rarocLiquidity, 0)} tone={kp.rarocLiquidity >= cfg.funding.targetRoe ? "good" : "warn"} sub={`بافر ${money(kp.liquidityCost)} • سرمایه ${money(kp.liquidityCapital)}`} icon="💧" />
                 <Stat label="تراز پول–زمان (عمر)" value={fmt(kp.moneyTimeRatio, 2)} tone={kp.moneyTimeRatio >= 1 ? "good" : "bad"} sub="سپرده‌ماه ÷ وام‌ماه" icon="⏱️" />
                 <Stat label="انتظار برای امتیاز" value={`${fmt(kp.avgWaitDays)} روز`} icon="⌛" />
               </>
@@ -689,6 +708,18 @@ export default function Lab({ productId, config, initial, history: initialHistor
         </Card>
       )}
 
+      {tab === "alm" && isPoints && (
+        <AlmLab
+          productId={productId}
+          cfg={cfg}
+          history={history}
+          busy={!!loading}
+          latest={almLatest}
+          onSaved={(item) => setHistory((h) => [item, ...h])}
+          onApplyTiers={(tiers) => applyPatch({ points: { tiers } })}
+        />
+      )}
+
       {tab === "history" && (
         <Card title="تاریخچه تحلیل‌ها" icon="🕘">
           {history.length === 0 ? (
@@ -714,8 +745,8 @@ export default function Lab({ productId, config, initial, history: initialHistor
                       <tr key={`${h.type}-${h.id}`} className="border-b border-slate-50 text-center">
                         <td className="p-2 text-right">{faDate(h.createdAt)}</td>
                         <td className="p-2"><Badge tone="indigo">{TYPE_LABEL[h.type] ?? h.type}</Badge></td>
-                        <td className="p-2">{SCENARIOS[h.scenario as ScenarioId]?.label ?? "همه سناریوها"}</td>
-                        <td className="p-2">{typeof s.netProfit === "number" ? money(s.netProfit) : typeof s.bestProfit === "number" ? money(s.bestProfit) : "—"}</td>
+                        <td className="p-2">{h.type === "alm" ? ALM_SCEN_LABEL[h.scenario] ?? "پایه (ALM)" : SCENARIOS[h.scenario as ScenarioId]?.label ?? "همه سناریوها"}</td>
+                        <td className="p-2">{typeof s.netProfit === "number" ? money(s.netProfit) : typeof s.bestProfit === "number" ? money(s.bestProfit) : typeof s.netMargin === "number" ? `${money(s.netMargin)} (حاشیه)` : "—"}</td>
                         <td className="p-2">{typeof s.raroc === "number" ? pct(s.raroc, 0) : "—"}</td>
                         <td className="p-2">{typeof s.nplEnd === "number" ? pct(s.nplEnd) : "—"}</td>
                         <td className="p-2">{typeof s.health === "number" ? `${fmt(s.health)} (${s.grade ?? ""})` : "—"}</td>

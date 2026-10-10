@@ -12,6 +12,14 @@ import type {
 } from "./types";
 
 // ===== Central Bank of Iran (CBI) regulatory constants — status 1405 =====
+/**
+ * Liquidity-risk assumptions for deposit-funded (points) products — educational, Basel III inspired.
+ * bufferRunoff: HQLA buffer as % of product deposits (LCR run-off for less-stable retail deposits);
+ * stressRunoff / stressSpread: extra outflow (%) refinanced at a stressed premium over FTP (percentage points)
+ * → liquidity capital = deposits × stressRunoff × stressSpread (one-year cost at risk held as capital).
+ */
+export const LIQUIDITY = { bufferRunoff: 10, stressRunoff: 20, stressSpread: 8 };
+
 export const CBI = {
   loanRateCap: 23, // max rate for non-participatory contracts
   participatoryCap: 23, // expected rate for participatory contracts (tolerance up to 24)

@@ -212,6 +212,9 @@ export function generateInsights(cfg: ProductConfig, sim: SimResult, comp: Compl
 
   // points specific
   const tieredPts = isPoints && cfg.points.mode === "tiered_murabaha" && cfg.points.tiers.length > 0;
+  if (isPoints && kp.raroc > 0 && kp.rarocCredit < 0) {
+    out.push({ id: "franchise", level: "warning", title: "ارزش طرح فقط از منابع ارزان است", body: `RAROC اعلامی ${fa(kp.raroc, 0)}٪ است، اما بدون ارزش منابع ارزان (FTP) به ${fa(kp.rarocCredit, 0)}٪ می‌رسد؛ با هزینه بافر نقدینگی و سرمایه ریسک نقدینگی ${fa(kp.rarocLiquidity, 0)}٪ می‌شود. سودآوری به ماندگاری سپرده و نرخ FTP وابسته است — سناریوی خروج سپرده را در آزمایشگاه ALM بسنجید.` });
+  }
   if (isPoints) {
     // coefficient / minimum-holding knobs do not exist in a tiered menu → only advise them in simple mode
     if (tieredPts) {
