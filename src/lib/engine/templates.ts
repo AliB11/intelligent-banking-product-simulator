@@ -67,6 +67,17 @@ export function defaultConfig(): ProductConfig {
       transferable: false,
       expiryMonths: 0,
       usageRate: 70,
+      mode: "simple",
+      tiers: [],
+      individualLoanCap: 400,
+      minOpeningDeposit: 0.1,
+      alphaStepPerWaitMonth: 25,
+      tenorStepPerWaitMonth: 8,
+      rateCutPerWaitMonth: 2,
+      maxAmountBoostMonths: 7,
+      maxTenorBoostMonths: 6,
+      maxRateCutMonths: 9,
+      allowCombinedBenefits: true,
     },
     loyalty: {
       pointsPer100k: 10,
@@ -79,6 +90,24 @@ export function defaultConfig(): ProductConfig {
       balanceUplift: 6,
       churnReduction: 15,
       gamification: false,
+    },
+    prepayment: {
+      enabled: false,
+      baseRate: 5,
+      sensitivityToRateGap: 2,
+      maxRate: 30,
+    },
+    gamification: {
+      enabled: false,
+      pointsPerExtraWaitMonth: 50,
+      lotteryChancePerMonth: 0.5,
+      topTierFeeDiscount: 50,
+    },
+    antiNegin: {
+      enabled: false,
+      fastLoanRate: 23,
+      fastLoanAlphaPct: 25,
+      fastLoanTenor: 12,
     },
   };
 }
@@ -115,14 +144,19 @@ export function normalizeConfig(input: unknown): ProductConfig {
     compensatingDeposit: [0, 90], downPayment: [0, 90],
   };
   const integers = new Set(["tenor", "grace", "minScore", "maxAge", "guarantors", "minHoldingDays", "expiryMonths", "interestFreeDays"]);
-  const clean = (base: Record<string, unknown>, raw: unknown): Record<string, unknown> => {
+  const clean = (base: any, raw: unknown): any => {
+    // مدیریت آرایه‌ها: آرایه ورودی را استفاده کن، در غیر این صورت از پایه استفاده کن
+    if (Array.isArray(base)) {
+      if (Array.isArray(raw)) return raw;
+      return base;
+    }
     const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
     return Object.fromEntries(Object.entries(base).map(([key, fallback]) => {
       const v = Object.hasOwn(source, key) ? source[key] : undefined;
-      if (typeof fallback === "object" && fallback !== null) return [key, clean(fallback as Record<string, unknown>, v)];
+      if (typeof fallback === "object" && fallback !== null) return [key, clean(fallback, v)];
       if (typeof fallback === "number") {
-        const [lo, hi] = limits[key] ?? [0, 100];
-        const n = typeof v === "number" && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback;
+        const [lo, hi] = limits[key] ?? [-1e9, 1e9];
+        const n = typeof v === "number" && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback as number;
         return [key, integers.has(key) ? Math.round(n) : n];
       }
       if (typeof fallback === "boolean") return [key, typeof v === "boolean" ? v : fallback];
@@ -312,6 +346,110 @@ export const TEMPLATES: Template[] = [
       risk: { minScore: 500, maxDti: 45, collateral: "e_promissory", altData: true },
       points: { coefficient: 3.2, minHoldingDays: 30, depositRate: 0, loanFee: 4, maxLoan: 1000, transferable: true, usageRate: 60 },
       funding: { costOfFunds: 18, opexPerAccount: 20, acquisitionCost: 100 },
+    },
+  },
+  {
+    key: "negin_farapuya",
+    title: "نگین فراپویا (مرابحه چندپله‌ای بانک سپه)",
+    group: "points",
+    inspiration: "طرح «نگین فراپویا» بانک سپه؛ سپرده کوتاه‌مدت ماه‌شمار با منوی سه‌گانه و ۲۵۰+ ترکیب انتخابی",
+    patch: {
+      name: "نگین فراپویا", code: "PTS-NEGIN-FP", tagline: "انتظاری هوشمندانه، وامی با منوی ۲۵۰ حالته", emoji: "🔷", color: "#0369a1",
+      family: "points", kind: "points_loan", contract: "murabaha", purpose: "cash", segment: "mass", channel: "omni",
+      description:
+        "سپرده کوتاه‌مدت ماه‌شمار ویژه با سود ۰.۰۱٪؛ دوره انتظار ۲ تا ۱۲ ماه، ضریب تسهیلات ۲۵٪ تا ۲۰۰٪ میانگین، نرخ سود ۵٪ تا ۲۳٪ و اقساط ۱۶/۲۴/۳۲/۴۰/۴۸/۵۶/۶۰ ماه. به ازای هر ماه انتظار اضافی مشتری یکی از سه گزینه افزایش مبلغ (+۲۵٪)، افزایش اقساط (+۸ماه) یا کاهش سود (-۲٪) را انتخاب می‌کند — حدود ۲۵۰ ترکیب. این الگو به موتور کامل ALM، تحلیل نقدینگی، گیمیفیکیشن سفر انتظار، ریسک پیش‌پرداخت و تسهیلات ضدنگین (فوری) تجهیز شده است.",
+      credit: {
+        rate: 13,
+        upfrontFee: 1,
+        annualFee: 0,
+        insurance: 0,
+        compensatingDeposit: 0,
+        minAmount: 10,
+        maxAmount: 400,
+        tenor: 36,
+        grace: 0,
+        repayment: "annuity",
+        stepUp: 0,
+        balloon: 0,
+        downPayment: 0,
+        merchantFee: 0,
+        interestFreeDays: 0,
+        revolvingShare: 0,
+        utilization: 0,
+        prepayDiscount: 90,
+        latePenaltySpread: 6,
+      },
+      risk: {
+        minScore: 500,
+        maxDti: 40,
+        collateral: "e_promissory",
+        coverage: 100,
+        guarantors: 1,
+        maxAge: 70,
+        altData: true,
+        behavioral: true,
+        collectionsIntensity: 55,
+      },
+      points: {
+        coefficient: 1.125,
+        minHoldingDays: 60,
+        depositRate: 0.01,
+        loanFee: 0,
+        maxLoan: 400,
+        transferable: false,
+        expiryMonths: 0,
+        usageRate: 72,
+        mode: "tiered_murabaha",
+        individualLoanCap: 400,
+        minOpeningDeposit: 0.1, // ۱۰۰ هزار تومان
+        alphaStepPerWaitMonth: 25,
+        tenorStepPerWaitMonth: 8,
+        rateCutPerWaitMonth: 2,
+        maxAmountBoostMonths: 7,
+        maxTenorBoostMonths: 6,
+        maxRateCutMonths: 9,
+        allowCombinedBenefits: true,
+        tiers: [
+          { name: "حالت اول (پایه)", waitingMonths: 2, repaymentMonths: 16, loanToAvgDepositPct: 25, rate: 23, minAvgDeposit: 1, expectedTakeUpShare: 30 },
+          { name: "حالت دوم", waitingMonths: 3, repaymentMonths: 24, loanToAvgDepositPct: 50, rate: 21, minAvgDeposit: 1, expectedTakeUpShare: 20 },
+          { name: "حالت سوم", waitingMonths: 4, repaymentMonths: 32, loanToAvgDepositPct: 75, rate: 19, minAvgDeposit: 1, expectedTakeUpShare: 16 },
+          { name: "حالت چهارم", waitingMonths: 6, repaymentMonths: 40, loanToAvgDepositPct: 100, rate: 15, minAvgDeposit: 1, expectedTakeUpShare: 13 },
+          { name: "حالت پنجم", waitingMonths: 8, repaymentMonths: 48, loanToAvgDepositPct: 125, rate: 11, minAvgDeposit: 1, expectedTakeUpShare: 9 },
+          { name: "حالت ششم", waitingMonths: 10, repaymentMonths: 56, loanToAvgDepositPct: 160, rate: 7, minAvgDeposit: 1, expectedTakeUpShare: 7 },
+          { name: "حالت هفتم (وفادار)", waitingMonths: 12, repaymentMonths: 60, loanToAvgDepositPct: 200, rate: 5, minAvgDeposit: 1, expectedTakeUpShare: 5 },
+        ],
+      },
+      funding: {
+        costOfFunds: 0.15,
+        opexPerAccount: 30,
+        acquisitionCost: 90,
+        riskWeight: 75,
+        targetCar: 10,
+        targetRoe: 32,
+        taxRate: 25,
+        reserveRatio: 10,
+      },
+      // ماژول ریسک پیش‌پرداخت زودهنگام
+      prepayment: {
+        enabled: true,
+        baseRate: 8,                // در شرایط نرخ برابر، سالانه ۸٪ پیش‌پرداخت
+        sensitivityToRateGap: 1.5,  // به ازای هر درصد اختلاف نرخ، ۱.۵ واحد درصد افزایش
+        maxRate: 35,                // حداکثر ۳۵٪ در سال برای وام‌های ۵٪ در بازار ۲۳٪
+      },
+      // گیمیفیکیشن سفر انتظار
+      gamification: {
+        enabled: true,
+        pointsPerExtraWaitMonth: 50,     // هر ماه انتظار ۵۰ امتیاز باشگاه
+        lotteryChancePerMonth: 0.8,      // هر ماه ۰.۸٪ شانس قرعه‌کشی (سکه/کمک‌هزینه)
+        topTierFeeDiscount: 100,         // تخفیف ۱۰۰٪ کارمزد برای پله هفتم (وفادار)
+      },
+      // ماژول ضدنگین (تسهیلات فوری برای پوشش حفره)
+      antiNegin: {
+        enabled: true,
+        fastLoanRate: 23,           // نرخ سقف برای متقاضیان عجول
+        fastLoanAlphaPct: 25,       // ضریب پایین برای تسهیلات فوری
+        fastLoanTenor: 12,          // بازپرداخت کوتاه ۱۲ ماهه
+      },
     },
   },
   {
